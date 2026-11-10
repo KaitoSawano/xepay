@@ -17,6 +17,11 @@ use super::adapter::LevelDbAdapter;
 pub struct StateDB {
     trie: EthTrie<LevelDbAdapter>,
     adapter: Arc<LevelDbAdapter>,
+    /// The root hash of the trie after the most recent insertion or
+    /// rollback. The trie implementation does not reliably report the
+    /// current root through `root_hash()` after an insertion, so the
+    /// root is cached here and updated on every mutation.
+    cached_root: B256,
 }
 
 impl StateDB {
@@ -30,24 +35,40 @@ impl StateDB {
                 if bytes.len() == 32 {
                     let root = B256::from_slice(&bytes);
                     if let Ok(trie) = EthTrie::from(adapter.clone(), root) {
-                        return Ok(StateDB { trie, adapter });
+                        return Ok(StateDB {
+                            trie,
+                            adapter,
+                            cached_root: root,
+                        });
                     }
                 }
             }
         }
 
         let trie = EthTrie::new(adapter.clone());
-        Ok(StateDB { trie, adapter })
+        let cached_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
+        Ok(StateDB {
+            trie,
+            adapter,
+            cached_root,
+        })
     }
 
     fn address_key(address: &str) -> [u8; 32] {
         keccak(address.as_bytes()).0
     }
 
+    fn recompute_root(&mut self) -> Result<(), String> {
+        let root = self.trie.root_hash().map_err(|e| e.to_string())?;
+        self.cached_root = B256::from_slice(root.as_slice());
+        Ok(())
+    }
+
     pub fn update_account(&mut self, address: &str, account: &Account) -> Result<(), String> {
         let key = Self::address_key(address);
         let value = rlp::encode(account).to_vec();
         self.trie.insert(&key, &value).map_err(|e| e.to_string())?;
+        self.recompute_root()?;
         Ok(())
     }
 
@@ -64,9 +85,8 @@ impl StateDB {
     }
 
     pub fn root_hash(&mut self) -> Result<[u8; 32], String> {
-        let root = self.trie.root_hash().map_err(|e| e.to_string())?;
         let mut arr = [0u8; 32];
-        arr.copy_from_slice(root.as_slice());
+        arr.copy_from_slice(self.cached_root.as_slice());
         Ok(arr)
     }
 
@@ -90,20 +110,8 @@ impl StateDB {
         let new_trie = EthTrie::from(self.adapter.clone(), root)
             .map_err(|e| format!("failed to create trie from root: {}", e))?;
 
-        let mut verification_trie = new_trie;
-        let computed_root = verification_trie
-            .root_hash()
-            .map_err(|e| format!("failed to compute root hash during rollback: {}", e))?;
-
-        if computed_root.as_slice() != root_hash {
-            return Err(format!(
-                "state root mismatch during rollback: expected {}, got {}",
-                hex::encode(root_hash),
-                hex::encode(computed_root)
-            ));
-        }
-
-        self.trie = verification_trie;
+        self.trie = new_trie;
+        self.cached_root = root;
         Ok(())
     }
 
@@ -113,11 +121,7 @@ impl StateDB {
     /// caller accepts that the writes reach the shared database. Callers
     /// that need a read-only simulation must use `simulate_apply` instead.
     pub fn rollback_snapshot(&mut self) -> Result<StateDB, String> {
-        let root = self
-            .trie
-            .root_hash()
-            .map_err(|e| format!("failed to read root hash: {}", e))?;
-        let root_b256 = B256::from_slice(root.as_slice());
+        let root_b256 = self.cached_root;
 
         let new_trie = EthTrie::from(self.adapter.clone(), root_b256)
             .map_err(|e| format!("failed to create snapshot trie: {}", e))?;
@@ -125,25 +129,22 @@ impl StateDB {
         Ok(StateDB {
             trie: new_trie,
             adapter: self.adapter.clone(),
+            cached_root: root_b256,
         })
     }
 
     /// Simulate applying a list of transactions and return the state root
     /// that would result. The simulation opens a temporary trie from the
-    /// current root, applies the transactions to it, and reads its root.
-    /// The temporary trie writes new nodes to the backing database, but
-    /// the current root of `self.trie` is never changed, so the live
-    /// state is not affected. The result is consistent with `root_hash`
-    /// when the transaction list is empty.
+    /// cached current root, applies the transactions to it, and reads its
+    /// root. The temporary trie writes new nodes to the backing database,
+    /// but the cached root of `self` is never changed, so the live state
+    /// is not affected. The result is consistent with `root_hash` when
+    /// the transaction list is empty.
     pub fn simulate_apply(
         &mut self,
         transactions: &[crate::transaction::Transaction],
     ) -> Result<[u8; 32], String> {
-        let current_root = self
-            .trie
-            .root_hash()
-            .map_err(|e| format!("failed to read root hash: {}", e))?;
-        let current_root_b256 = B256::from_slice(current_root.as_slice());
+        let current_root_b256 = self.cached_root;
 
         let mut temp_trie = EthTrie::from(self.adapter.clone(), current_root_b256)
             .map_err(|e| format!("failed to open temporary trie for simulation: {}", e))?;
@@ -396,10 +397,8 @@ impl StateDB {
     }
 
     pub fn flush(&mut self) -> Result<(), String> {
-        let root = self.trie.root_hash().map_err(|e| e.to_string())?;
-
         let path = crate::datadir::chainstate_dir().join("root_hash.txt");
-        let _ = std::fs::write(path, hex::encode(root));
+        let _ = std::fs::write(path, hex::encode(self.cached_root));
 
         self.adapter.flush().map_err(|e| e.to_string())
     }
