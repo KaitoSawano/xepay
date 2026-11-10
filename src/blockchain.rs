@@ -321,8 +321,6 @@ impl Blockchain {
 
         if let Ok(root) = state.root_hash() {
             genesis.state_root = hex::encode(root);
-            // Genesis hash is intentionally NOT recalculated here.
-            // It stays locked to the consensus constant.
         }
 
         Blockchain {
@@ -408,6 +406,13 @@ impl Blockchain {
             return Ok(());
         }
 
+        if !self.addresses.contains(&tx.from) {
+            self.addresses.push(tx.from.clone());
+        }
+        if !self.addresses.contains(&tx.to) {
+            self.addresses.push(tx.to.clone());
+        }
+
         let current_nonce = self.state.nonce_of(&tx.from);
         if tx.nonce != current_nonce {
             return Err(format!(
@@ -456,15 +461,7 @@ impl Blockchain {
         tx.fee / size
     }
 
-    /// Evict the lowest total-fee transactions to make room for new ones.
-    ///
-    /// This method is `pub` because it is exercised by integration tests
-    /// in `src/tests/security_hardening_test.rs`. It is not part of the
-    /// public RPC surface.
     pub fn evict_lowest_fee_transactions(&mut self, needed_space: usize) {
-        // Sort by total absolute fee (fee_rate * size), ascending.
-        // This ensures that transactions with the highest total fee are kept,
-        // regardless of their size.
         self.mempool.sort_by(|a, b| {
             let fee_a = Self::fee_rate(a).saturating_mul(Self::tx_size_bytes(a) as u64);
             let fee_b = Self::fee_rate(b).saturating_mul(Self::tx_size_bytes(b) as u64);
@@ -645,8 +642,6 @@ impl Blockchain {
 
         let interval = spec::DIFFICULTY_ADJUST_INTERVAL as usize;
 
-        // Use Median Time Past (MTP) instead of raw timestamp
-        // to prevent miners from manipulating the timestamp.
         let last_mtp = self.median_time_past_at(height as usize);
         let first_mtp = self.median_time_past_at((height as usize) - interval);
 
@@ -659,8 +654,6 @@ impl Blockchain {
 
         let current_target = pow::nbits_to_target(self.nbits);
 
-        // Clamp the adjustment to a factor of 4 (0.25x to 4x)
-        // This prevents extreme difficulty jumps.
         let mut scale = (actual_time_secs as u128)
             .checked_mul(256)
             .unwrap_or(u128::MAX) / (expected_time_secs as u128);
