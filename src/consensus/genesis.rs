@@ -106,7 +106,7 @@ pub const REGTEST_EXPECTED_GENESIS_HASH: &str =
 
 // The expected regtest genesis merkle root.
 pub const REGTEST_EXPECTED_GENESIS_MERKLE_ROOT: &str =
-    "PLACEHOLDER_RUN_XEPAY_GENESIS_REGTEST";
+    "8af01af7ca4b233428b7c2bf6ea9de4148272a5aea72dd16cda0870435aba720";
 
 // The expected regtest genesis timestamp.
 pub const REGTEST_EXPECTED_GENESIS_TIMESTAMP: u128 = 1792303198447;
