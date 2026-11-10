@@ -613,7 +613,8 @@ impl RpcHandler {
         let total_fees: u64 = mempool_snapshot.iter().map(|tx| tx.fee).sum();
         let reward = subsidy.saturating_add(total_fees);
 
-        let state_root = match c.state.simulate_apply(&mempool_snapshot) {
+        let addresses = c.addresses.clone();
+        let state_root = match c.state.simulate_apply(&addresses, &mempool_snapshot) {
             Ok(root) => hex::encode(root),
             Err(e) => {
                 return RpcResponse::err(&format!(
