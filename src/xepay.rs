@@ -43,7 +43,13 @@ fn main() {
         "getnetworkinfo" => rpc::call_and_print("getnetworkinfo", vec![]),
         "getpeerinfo" => rpc::call_and_print("getpeerinfo", vec![]),
         "getcheckpoints" => rpc::call_and_print("getcheckpoints", vec![]),
-        "getblocktemplate" => rpc::call_and_print("getblocktemplate", vec![]),
+        "getblocktemplate" => {
+            if args.len() < 3 {
+                println!("usage: xepay getblocktemplate \"<mining_address>\"");
+                return;
+            }
+            rpc::call_and_print("getblocktemplate", vec![json!(args[2])]);
+        }
         "getblockcount" => rpc::call_and_print("getblockcount", vec![]),
         "getbestblockhash" => rpc::call_and_print("getbestblockhash", vec![]),
         "verifychain" => rpc::call_and_print("verifychain", vec![]),
@@ -238,7 +244,6 @@ fn main() {
             }
             println!("connect command is not yet implemented in CLI. Use P2P bootstrap instead.");
         }
-        // === HD Wallet CLI ===
         "createhdwallet" => {
             let word_count = if args.len() >= 3 {
                 match args[2].parse::<u64>() {
@@ -307,7 +312,7 @@ fn print_help() {
     println!("  getnetworkinfo                      network parameters");
     println!("  getpeerinfo                         list connected peers");
     println!("  getcheckpoints                      list of active checkpoints");
-    println!("  getblocktemplate                    block template for miners");
+    println!("  getblocktemplate \"<mining_address>\"  block template for miners");
     println!("  getblockcount                       number of blocks in the chain");
     println!("  getbestblockhash                    hash of the latest block");
     println!("  getdifficulty                       current proof-of-work difficulty");
