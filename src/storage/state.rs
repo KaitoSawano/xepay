@@ -9,7 +9,7 @@ use eth_trie::{EthTrie, Trie, DB};
 use keccak_hash::keccak;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::account::Account;
 use super::adapter::LevelDbAdapter;
@@ -134,20 +134,27 @@ impl StateDB {
     }
 
     /// Simulate applying a list of transactions and return the state root
-    /// that would result. The simulation opens a temporary trie from the
-    /// cached current root, applies the transactions to it, and reads its
-    /// root. The temporary trie writes new nodes to the backing database,
-    /// but the cached root of `self` is never changed, so the live state
-    /// is not affected. The result is consistent with `root_hash` when
-    /// the transaction list is empty.
+    /// that would result. The simulation builds an in-memory copy of the
+    /// current trie from the supplied address list, applies the
+    /// transactions to that copy, and reads its root. The persistent
+    /// database is never written to, so the live state is not affected.
     pub fn simulate_apply(
-        &mut self,
+        &self,
+        addresses: &[String],
         transactions: &[crate::transaction::Transaction],
     ) -> Result<[u8; 32], String> {
-        let current_root_b256 = self.cached_root;
+        let memory_db = Arc::new(MemoryDb::new());
+        let mut temp_trie = EthTrie::new(memory_db.clone());
 
-        let mut temp_trie = EthTrie::from(self.adapter.clone(), current_root_b256)
-            .map_err(|e| format!("failed to open temporary trie for simulation: {}", e))?;
+        for address in addresses {
+            if let Some(account) = self.get_account(address)? {
+                let key = Self::address_key(address);
+                let value = rlp::encode(&account).to_vec();
+                temp_trie
+                    .insert(&key, &value)
+                    .map_err(|e| format!("failed to seed simulation trie: {}", e))?;
+            }
+        }
 
         for tx in transactions {
             if crate::validation::is_special_tx(tx) {
@@ -431,5 +438,45 @@ fn read_account_from_trie<D: DB>(
             Ok(Some(account))
         }
         None => Ok(None),
+    }
+}
+
+// A minimal in-memory DB implementation used by `simulate_apply` so that
+// the simulation never writes to the persistent LevelDB.
+#[derive(Clone, Default)]
+struct MemoryDb {
+    inner: Arc<Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl MemoryDb {
+    fn new() -> Self {
+        MemoryDb {
+            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+impl DB for MemoryDb {
+    type Error = std::io::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert(key.to_vec(), value);
+        Ok(())
+    }
+
+    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.remove(key);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
