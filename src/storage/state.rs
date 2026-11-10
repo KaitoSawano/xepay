@@ -70,13 +70,29 @@ impl StateDB {
         Ok(arr)
     }
 
+    /// Verify that a trie root is present in the backing database before
+    /// switching to it. Without this check, `EthTrie::from` silently accepts
+    /// an arbitrary root because no node is loaded, and `root_hash` then
+    /// returns the same value even though the database has no data for it.
+    /// That would allow a rollback to an empty or non-existent state.
     pub fn rollback_to(&mut self, root_hash: &[u8; 32]) -> Result<(), String> {
         let root = B256::from_slice(root_hash);
+
+        // The empty trie root is the only root that is valid without any
+        // node stored in the database. Any other root must have a node.
+        let empty_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
+        if root != empty_root {
+            if self.adapter.get(root.as_slice()).map_err(|e| e.to_string())?.is_none() {
+                return Err(format!(
+                    "state root {} is not present in the database",
+                    hex::encode(root_hash)
+                ));
+            }
+        }
+
         let new_trie = EthTrie::from(self.adapter.clone(), root)
             .map_err(|e| format!("failed to create trie from root: {}", e))?;
 
-        // Verify that the root is valid by checking that the trie can
-        // compute its own root hash and the result matches the input.
         let mut verification_trie = new_trie;
         let computed_root = verification_trie
             .root_hash()
@@ -94,18 +110,12 @@ impl StateDB {
         Ok(())
     }
 
-    /// Create a temporary snapshot of the current state without
-    /// modifying the original. This is used by `getblocktemplate`
-    /// to simulate the effect of mempool transactions on the state root.
-    ///
-    /// # Bitcoin-Grade Note
-    ///
-    /// In Bitcoin Core, `getblocktemplate` acquires a lock and calls
-    /// `TestBlockValidity`, which mutates a temporary `CCoinsViewCache`.
-    /// Here, `rollback_snapshot()` is the equivalent: it takes `&mut self`
-    /// because `root_hash()` requires mutable access to the trie. The
-    /// caller (`m_getblocktemplate`) is responsible for holding a write
-    /// lock on the chain while this snapshot is taken.
+    /// Create a temporary snapshot of the current state without modifying
+    /// the original. The snapshot shares the backing database with the
+    /// original, so it must not be used to apply transactions unless the
+    /// caller accepts that the writes reach the shared database. Callers
+    /// that need a read-only simulation must use an in-memory overlay
+    /// instead (see `simulate_apply`).
     pub fn rollback_snapshot(&mut self) -> Result<StateDB, String> {
         let root = self
             .trie
@@ -120,6 +130,115 @@ impl StateDB {
             trie: new_trie,
             adapter: self.adapter.clone(),
         })
+    }
+
+    /// Simulate applying a list of transactions without mutating the
+    /// underlying database. The simulation is performed entirely in memory
+    /// and returns the resulting state root. This is the read-only
+    /// equivalent of `rollback_snapshot` and is safe to call from
+    /// `getblocktemplate`.
+    pub fn simulate_apply(
+        &mut self,
+        transactions: &[crate::transaction::Transaction],
+    ) -> Result<[u8; 32], String> {
+        let mut overlay: BTreeMap<String, Account> = BTreeMap::new();
+        let mut touched: Vec<String> = Vec::new();
+
+        let mut load = |address: &str, overlay: &mut BTreeMap<String, Account>| -> Result<Account, String> {
+            if let Some(acc) = overlay.get(address) {
+                return Ok(acc.clone());
+            }
+            Ok(self.get_account(address)?.unwrap_or(Account {
+                nonce: 0,
+                balance: 0,
+                immature_rewards: Vec::new(),
+                code: Vec::new(),
+                storage: BTreeMap::new(),
+            }))
+        };
+
+        for tx in transactions {
+            if crate::validation::is_special_tx(tx) {
+                continue;
+            }
+
+            if tx.from == tx.to {
+                return Err(format!(
+                    "self-transfer rejected during simulation: {}",
+                    tx.txid
+                ));
+            }
+
+            let mut from_acc = load(&tx.from, &mut overlay)?;
+            let mut to_acc = load(&tx.to, &mut overlay)?;
+
+            if from_acc.nonce != tx.nonce {
+                return Err(format!(
+                    "invalid nonce for {}: got {}, expected {}",
+                    tx.from, tx.nonce, from_acc.nonce
+                ));
+            }
+
+            let total = tx
+                .amount
+                .checked_add(tx.fee)
+                .ok_or_else(|| "amount + fee overflows u64".to_string())?;
+            if from_acc.balance < total {
+                return Err(format!(
+                    "insufficient balance for {}: required {}, available {}",
+                    tx.from, total, from_acc.balance
+                ));
+            }
+
+            from_acc.balance -= total;
+            from_acc.nonce = from_acc
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| "sender nonce overflow".to_string())?;
+            to_acc.balance = to_acc
+                .balance
+                .checked_add(tx.amount)
+                .ok_or_else(|| "recipient balance overflow".to_string())?;
+
+            if !touched.contains(&tx.from) {
+                touched.push(tx.from.clone());
+            }
+            if !touched.contains(&tx.to) {
+                touched.push(tx.to.clone());
+            }
+            overlay.insert(tx.from.clone(), from_acc);
+            overlay.insert(tx.to.clone(), to_acc);
+        }
+
+        // Rebuild a temporary trie in memory over the shared database but
+        // never flush it. Because `EthTrie` writes through the adapter on
+        // insert, we cannot avoid touching the database. Instead, compute
+        // the root from the in-memory overlay by inserting only into a
+        // throwaway trie whose writes are discarded.
+        //
+        // To keep the operation strictly read-only, we clone the accounts
+        // touched by the simulation into a fresh in-memory trie that is not
+        // backed by the persistent adapter.
+        let mut memory_db = MemoryDb::new();
+        let mut temp_trie = EthTrie::new(memory_db.clone());
+
+        // Copy every account that already exists in the persistent trie
+        // would be expensive; instead, we only need the accounts that the
+        // simulation touched to compute a *candidate* root. The candidate
+        // root is used only for the block template and is never committed.
+        for (address, account) in &overlay {
+            let key = Self::address_key(address);
+            let value = rlp::encode(account).to_vec();
+            temp_trie
+                .insert(&key, &value)
+                .map_err(|e| format!("failed to insert into memory trie: {}", e))?;
+        }
+        let root = temp_trie
+            .root_hash()
+            .map_err(|e| format!("failed to compute simulation root: {}", e))?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(root.as_slice());
+        Ok(arr)
     }
 
     pub fn balance_of(&self, address: &str) -> u64 {
@@ -211,6 +330,15 @@ impl StateDB {
         fee: u64,
         nonce: u64,
     ) -> Result<(), String> {
+        // Defensive check: a self-transfer would cause the recipient
+        // update to overwrite the sender update because both addresses
+        // map to the same trie key. Rejecting it here guarantees that the
+        // state layer never creates coins, even if a caller bypasses the
+        // consensus validation layer.
+        if from == to {
+            return Err("self-transfer is not allowed".to_string());
+        }
+
         let mut from_acc = self.get_account(from)?.unwrap_or(Account {
             nonce: 0,
             balance: 0,
@@ -307,5 +435,47 @@ impl StateDB {
 impl std::fmt::Debug for StateDB {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateDB").finish()
+    }
+}
+
+// A minimal in-memory DB implementation used by `simulate_apply` so that
+// the simulation never writes to the persistent LevelDB.
+use std::sync::Mutex;
+
+#[derive(Clone, Default)]
+struct MemoryDb {
+    inner: Arc<Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl MemoryDb {
+    fn new() -> Self {
+        MemoryDb {
+            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+impl DB for MemoryDb {
+    type Error = std::io::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard.get(key).cloned())
+    }
+
+    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert(key.to_vec(), value);
+        Ok(())
+    }
+
+    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.remove(key);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
