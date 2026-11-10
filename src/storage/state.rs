@@ -9,7 +9,7 @@ use eth_trie::{EthTrie, Trie, DB};
 use keccak_hash::keccak;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::account::Account;
 use super::adapter::LevelDbAdapter;
@@ -128,12 +128,13 @@ impl StateDB {
         })
     }
 
-    /// Simulate applying a list of transactions without mutating the
-    /// underlying database. The simulation runs on an in-memory copy of
-    /// the current trie and returns the resulting state root. The copy
-    /// includes every node reachable from the current root, so the
-    /// returned root is consistent with `root_hash` when the transaction
-    /// list is empty.
+    /// Simulate applying a list of transactions and return the state root
+    /// that would result. The simulation opens a temporary trie from the
+    /// current root, applies the transactions to it, and reads its root.
+    /// The temporary trie writes new nodes to the backing database, but
+    /// the current root of `self.trie` is never changed, so the live
+    /// state is not affected. The result is consistent with `root_hash`
+    /// when the transaction list is empty.
     pub fn simulate_apply(
         &mut self,
         transactions: &[crate::transaction::Transaction],
@@ -144,10 +145,8 @@ impl StateDB {
             .map_err(|e| format!("failed to read root hash: {}", e))?;
         let current_root_b256 = B256::from_slice(current_root.as_slice());
 
-        let memory_db = Arc::new(MemoryDb::new());
-        copy_trie_nodes(self.adapter.as_ref(), current_root_b256.as_slice(), memory_db.as_ref())?;
-
-        let mut temp_trie = EthTrie::new(memory_db.clone());
+        let mut temp_trie = EthTrie::from(self.adapter.clone(), current_root_b256)
+            .map_err(|e| format!("failed to open temporary trie for simulation: {}", e))?;
 
         for tx in transactions {
             if crate::validation::is_special_tx(tx) {
@@ -433,114 +432,5 @@ fn read_account_from_trie<D: DB>(
             Ok(Some(account))
         }
         None => Ok(None),
-    }
-}
-
-/// Recursively copy every node reachable from `root` in `source` into
-/// `dest`. The walk uses the node references stored in each branch and
-/// extension node, which are the same references the trie uses to
-/// resolve lookups. Leaf nodes are copied verbatim.
-fn copy_trie_nodes<D: DB>(
-    source: &D,
-    root: &[u8],
-    dest: &MemoryDb,
-) -> Result<(), String> {
-    if root.len() != 32 {
-        return Ok(());
-    }
-    let root_b256 = B256::from_slice(root);
-    copy_node(source, root_b256.as_slice(), dest, &mut Vec::new())
-}
-
-fn copy_node<D: DB>(
-    source: &D,
-    hash: &[u8],
-    dest: &MemoryDb,
-    visited: &mut Vec<Vec<u8>>,
-) -> Result<(), String> {
-    let key = hash.to_vec();
-    if visited.iter().any(|k| k == &key) {
-        return Ok(());
-    }
-    visited.push(key.clone());
-
-    let value = match source.get(&key).map_err(|e| format!("trie read failed: {}", e))? {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-
-    dest.insert(&key, value.clone())
-        .map_err(|e| format!("trie copy failed: {}", e))?;
-
-    // Decode the node to discover child references. The first byte of an
-    // RLP list distinguishes a branch node (0xc0..=0xff, list) from an
-    // extension or leaf node (also a list). Both branch and extension
-    // nodes contain child references as 32-byte hashes. Leaf nodes have
-    // no children.
-    let decoded = rlp::Rlp::new(&value);
-    if !decoded.is_list() {
-        return Ok(());
-    }
-
-    let item_count = decoded.item_count().unwrap_or(0);
-    // Branch nodes have 17 items; extension nodes have 2 items and the
-    // first item is the encoded path, the second is the child hash.
-    // Leaf nodes have 2 items but the second is the value, not a hash.
-    // We copy any 32-byte child reference that resolves to a node.
-    for i in 0..item_count {
-        let child = match decoded.at(i) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let child_data = match child.data() {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if child_data.len() != 32 {
-            continue;
-        }
-        copy_node(source, child_data, dest, visited)?;
-    }
-
-    Ok(())
-}
-
-// A minimal in-memory DB implementation used by `simulate_apply` so that
-// the simulation never writes to the persistent LevelDB.
-#[derive(Clone, Default)]
-struct MemoryDb {
-    inner: Arc<Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
-}
-
-impl MemoryDb {
-    fn new() -> Self {
-        MemoryDb {
-            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-}
-
-impl DB for MemoryDb {
-    type Error = std::io::Error;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        let guard = self.inner.lock().unwrap();
-        Ok(guard.get(key).cloned())
-    }
-
-    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.insert(key.to_vec(), value);
-        Ok(())
-    }
-
-    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(key);
-        Ok(())
-    }
-
-    fn flush(&self) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
