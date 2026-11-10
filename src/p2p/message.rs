@@ -2,11 +2,10 @@
 // Distributed under the Apache License, see the accompanying
 // file LICENSE or https://www.apache.org/licenses/LICENSE-2.0.
 
-//! Peer-to-peer message types for XEPAY, modeled after Bitcoin.
+//! Peer-to-peer message types for XEPAY, serialized manually.
 //!
-//! Serialization is performed manually: integers are encoded in
-//! little-endian byte order, array and string lengths use a varint
-//! encoding, and hashes are encoded as 32 raw bytes.
+//! Integers are encoded in little-endian byte order, array and string
+//! lengths use a varint encoding, and hashes are encoded as 32 raw bytes.
 
 use crate::block::Block;
 use crate::blockchain::Blockchain;
@@ -16,11 +15,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const USER_AGENT: &str = "/xepay:0.1.0/";
 
-// The maximum payload length has been increased to 32 MB to
-// accommodate larger header batches (5,000 headers) during sync.
 pub const MAX_PAYLOAD_LEN: usize = 32 * 1024 * 1024;
 
-/// Inventory type: transaction or block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InvType {
     Transaction = 1,
@@ -408,7 +404,8 @@ impl Message {
                     input = &input[32..];
                     let _tx_count = read_varint(&mut input)?;
 
-                    let mut b = Block::new(index, previous_hash.clone(), reward, nbits, Vec::new());
+                    let mut b = Block::new(index, previous_hash.clone(), reward, nbits, Vec::new())
+                        .map_err(|e| format!("headers: invalid header at index {}: {}", index, e))?;
                     b.nversion = nversion;
                     b.timestamp = timestamp;
                     b.previous_hash = previous_hash;
