@@ -18,8 +18,16 @@ fn main() {
         rpc::DEFAULT_RPC_ADDR
     );
 
+    let target_address =
+        std::env::var("XEPC_MINE_FOR").unwrap_or_else(|_| "UNKNOWN".to_string());
+
+    if target_address == "UNKNOWN" {
+        println!("[miner] XEPC_MINE_FOR is not set. Set it to a valid XEPAY address.");
+        return;
+    }
+
     loop {
-        let template = match rpc::call("getblocktemplate", vec![]) {
+        let template = match rpc::call("getblocktemplate", vec![serde_json::json!(target_address)]) {
             Ok(r) if r.ok => r.result,
             Ok(r) => {
                 println!("[miner] node rejected the request: {}", r.error);
@@ -52,24 +60,14 @@ fn main() {
             }
         };
 
-        let subsidy_satoshi = template["subsidy_satoshi"].as_u64().unwrap_or(0);
-        let total_fees_satoshi = template["total_fees_satoshi"].as_u64().unwrap_or(0);
-        let reward_satoshi = template["reward_satoshi"].as_u64().unwrap_or(0);
+        let subsidy_satoshi = template["subsidy_ald"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let total_fees_satoshi = template["total_fees_ald"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let reward_satoshi = template["reward_ald"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
         let state_root = template["state_root"].as_str().unwrap_or("").to_string();
 
         let mempool: Vec<Transaction> =
             serde_json::from_value(template["mempool"].clone()).unwrap_or_default();
 
-        let target_address =
-            std::env::var("XEPC_MINE_FOR").unwrap_or_else(|_| "UNKNOWN".to_string());
-
-        if target_address == "UNKNOWN" {
-            println!("[miner] XEPC_MINE_FOR is not set. Set it to a valid XEPAY address.");
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            continue;
-        }
-
-        // BITCOIN-GRADE: Handle Result from Block::new_for
         let mut block = match Block::new_for(
             height,
             previous_hash,
