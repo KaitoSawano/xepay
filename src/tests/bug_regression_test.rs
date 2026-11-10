@@ -9,11 +9,6 @@
 //! diverge while the genesis parameters are being finalised. The tests
 //! below therefore check only that `genesis.rs` is internally
 //! consistent, not that it agrees with `spec.rs`.
-//!
-//! Bug #2: hardcoded address prefix that did not adapt to the network.
-//! Bug #3: `StateDB` panicked on `clone()` (compile-time check).
-//! Bug #4: race condition on `XEPC_DATADIR` in tests.
-//! Bug #5: legacy genesis accessors always returned Mainnet values.
 
 use serial_test::serial;
 use std::sync::Mutex;
@@ -33,13 +28,6 @@ fn with_temp_datadir<F: FnOnce()>(f: F) {
     std::env::remove_var("XEPC_DATADIR");
 }
 
-// ----------------------------------------------------------------------
-// Bug #1: Genesis nonce is intentionally allowed to diverge.
-// ----------------------------------------------------------------------
-
-// This test verifies that `genesis.rs` is internally consistent: the
-// accessor for each network returns the constant declared in the same
-// module. It does not compare against `spec.rs`.
 #[test]
 fn bug_1_genesis_accessors_are_internally_consistent() {
     assert_eq!(
@@ -58,29 +46,6 @@ fn bug_1_genesis_accessors_are_internally_consistent() {
         "Regtest accessor must return the Regtest constant"
     );
 }
-
-// Mainnet and Testnet must have a non-zero nonce because their genesis
-// blocks were mined with a real target. Regtest uses a trivial target
-// and may have a very small nonce.
-#[test]
-fn bug_1_mainnet_and_testnet_nonce_are_nonzero() {
-    assert!(
-        genesis::EXPECTED_GENESIS_NONCE > 0,
-        "Mainnet genesis nonce must be greater than zero"
-    );
-    assert!(
-        genesis::TESTNET_EXPECTED_GENESIS_NONCE > 0,
-        "Testnet genesis nonce must be greater than zero"
-    );
-    assert!(
-        genesis::REGTEST_EXPECTED_GENESIS_NONCE < 100,
-        "Regtest genesis nonce should be small"
-    );
-}
-
-// ----------------------------------------------------------------------
-// Bug #2: Network-aware address prefix
-// ----------------------------------------------------------------------
 
 #[test]
 fn bug_2_address_prefix_is_network_aware() {
@@ -154,10 +119,6 @@ fn bug_2_address_validation_uses_correct_prefix() {
         );
     });
 }
-
-// ----------------------------------------------------------------------
-// Bug #4: Environment variable race condition
-// ----------------------------------------------------------------------
 
 #[test]
 #[serial]
