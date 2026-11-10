@@ -2,14 +2,14 @@
 // Distributed under the Apache License, see the accompanying
 // file LICENSE or https://www.apache.org/licenses/LICENSE-2.0.
 
-//! State database using Merkle Patricia Trie backed by LevelDB.
+//! State database using a Merkle Patricia Trie backed by LevelDB.
 
 use alloy_primitives::B256;
 use eth_trie::{EthTrie, Trie, DB};
 use keccak_hash::keccak;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::account::Account;
 use super::adapter::LevelDbAdapter;
@@ -74,12 +74,9 @@ impl StateDB {
     /// switching to it. Without this check, `EthTrie::from` silently accepts
     /// an arbitrary root because no node is loaded, and `root_hash` then
     /// returns the same value even though the database has no data for it.
-    /// That would allow a rollback to an empty or non-existent state.
     pub fn rollback_to(&mut self, root_hash: &[u8; 32]) -> Result<(), String> {
         let root = B256::from_slice(root_hash);
 
-        // The empty trie root is the only root that is valid without any
-        // node stored in the database. Any other root must have a node.
         let empty_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
         if root != empty_root {
             if self.adapter.get(root.as_slice()).map_err(|e| e.to_string())?.is_none() {
@@ -114,8 +111,7 @@ impl StateDB {
     /// the original. The snapshot shares the backing database with the
     /// original, so it must not be used to apply transactions unless the
     /// caller accepts that the writes reach the shared database. Callers
-    /// that need a read-only simulation must use an in-memory overlay
-    /// instead (see `simulate_apply`).
+    /// that need a read-only simulation must use `simulate_apply` instead.
     pub fn rollback_snapshot(&mut self) -> Result<StateDB, String> {
         let root = self
             .trie
@@ -133,29 +129,25 @@ impl StateDB {
     }
 
     /// Simulate applying a list of transactions without mutating the
-    /// underlying database. The simulation is performed entirely in memory
-    /// and returns the resulting state root. This is the read-only
-    /// equivalent of `rollback_snapshot` and is safe to call from
-    /// `getblocktemplate`.
+    /// underlying database. The simulation runs on an in-memory copy of
+    /// the current trie and returns the resulting state root. The copy
+    /// includes every node reachable from the current root, so the
+    /// returned root is consistent with `root_hash` when the transaction
+    /// list is empty.
     pub fn simulate_apply(
         &mut self,
         transactions: &[crate::transaction::Transaction],
     ) -> Result<[u8; 32], String> {
-        let mut overlay: BTreeMap<String, Account> = BTreeMap::new();
-        let mut touched: Vec<String> = Vec::new();
+        let current_root = self
+            .trie
+            .root_hash()
+            .map_err(|e| format!("failed to read root hash: {}", e))?;
+        let current_root_b256 = B256::from_slice(current_root.as_slice());
 
-        let mut load = |address: &str, overlay: &mut BTreeMap<String, Account>| -> Result<Account, String> {
-            if let Some(acc) = overlay.get(address) {
-                return Ok(acc.clone());
-            }
-            Ok(self.get_account(address)?.unwrap_or(Account {
-                nonce: 0,
-                balance: 0,
-                immature_rewards: Vec::new(),
-                code: Vec::new(),
-                storage: BTreeMap::new(),
-            }))
-        };
+        let memory_db = Arc::new(MemoryDb::new());
+        copy_trie_nodes(self.adapter.as_ref(), current_root_b256.as_slice(), memory_db.as_ref())?;
+
+        let mut temp_trie = EthTrie::new(memory_db.clone());
 
         for tx in transactions {
             if crate::validation::is_special_tx(tx) {
@@ -169,8 +161,13 @@ impl StateDB {
                 ));
             }
 
-            let mut from_acc = load(&tx.from, &mut overlay)?;
-            let mut to_acc = load(&tx.to, &mut overlay)?;
+            let from_key = Self::address_key(&tx.from);
+            let to_key = Self::address_key(&tx.to);
+
+            let mut from_acc = read_account_from_trie(&mut temp_trie, &from_key)?
+                .unwrap_or_else(empty_account);
+            let mut to_acc = read_account_from_trie(&mut temp_trie, &to_key)?
+                .unwrap_or_else(empty_account);
 
             if from_acc.nonce != tx.nonce {
                 return Err(format!(
@@ -200,39 +197,16 @@ impl StateDB {
                 .checked_add(tx.amount)
                 .ok_or_else(|| "recipient balance overflow".to_string())?;
 
-            if !touched.contains(&tx.from) {
-                touched.push(tx.from.clone());
-            }
-            if !touched.contains(&tx.to) {
-                touched.push(tx.to.clone());
-            }
-            overlay.insert(tx.from.clone(), from_acc);
-            overlay.insert(tx.to.clone(), to_acc);
-        }
-
-        // Rebuild a temporary trie in memory over the shared database but
-        // never flush it. Because `EthTrie` writes through the adapter on
-        // insert, we cannot avoid touching the database. Instead, compute
-        // the root from the in-memory overlay by inserting only into a
-        // throwaway trie whose writes are discarded.
-        //
-        // To keep the operation strictly read-only, we clone the accounts
-        // touched by the simulation into a fresh in-memory trie that is not
-        // backed by the persistent adapter.
-        let mut memory_db = MemoryDb::new();
-        let mut temp_trie = EthTrie::new(memory_db.clone());
-
-        // Copy every account that already exists in the persistent trie
-        // would be expensive; instead, we only need the accounts that the
-        // simulation touched to compute a *candidate* root. The candidate
-        // root is used only for the block template and is never committed.
-        for (address, account) in &overlay {
-            let key = Self::address_key(address);
-            let value = rlp::encode(account).to_vec();
+            let from_value = rlp::encode(&from_acc).to_vec();
+            let to_value = rlp::encode(&to_acc).to_vec();
             temp_trie
-                .insert(&key, &value)
-                .map_err(|e| format!("failed to insert into memory trie: {}", e))?;
+                .insert(&from_key, &from_value)
+                .map_err(|e| format!("failed to insert sender into simulation: {}", e))?;
+            temp_trie
+                .insert(&to_key, &to_value)
+                .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
         }
+
         let root = temp_trie
             .root_hash()
             .map_err(|e| format!("failed to compute simulation root: {}", e))?;
@@ -438,10 +412,101 @@ impl std::fmt::Debug for StateDB {
     }
 }
 
+fn empty_account() -> Account {
+    Account {
+        nonce: 0,
+        balance: 0,
+        immature_rewards: Vec::new(),
+        code: Vec::new(),
+        storage: BTreeMap::new(),
+    }
+}
+
+fn read_account_from_trie<D: DB>(
+    trie: &mut EthTrie<D>,
+    key: &[u8; 32],
+) -> Result<Option<Account>, String> {
+    match trie.get(key).map_err(|e| format!("trie read failed: {}", e))? {
+        Some(value) => {
+            let account: Account =
+                rlp::decode(&value).map_err(|e| format!("RLP decode error: {}", e))?;
+            Ok(Some(account))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Recursively copy every node reachable from `root` in `source` into
+/// `dest`. The walk uses the node references stored in each branch and
+/// extension node, which are the same references the trie uses to
+/// resolve lookups. Leaf nodes are copied verbatim.
+fn copy_trie_nodes<D: DB>(
+    source: &D,
+    root: &[u8],
+    dest: &MemoryDb,
+) -> Result<(), String> {
+    if root.len() != 32 {
+        return Ok(());
+    }
+    let root_b256 = B256::from_slice(root);
+    copy_node(source, root_b256.as_slice(), dest, &mut Vec::new())
+}
+
+fn copy_node<D: DB>(
+    source: &D,
+    hash: &[u8],
+    dest: &MemoryDb,
+    visited: &mut Vec<Vec<u8>>,
+) -> Result<(), String> {
+    let key = hash.to_vec();
+    if visited.iter().any(|k| k == &key) {
+        return Ok(());
+    }
+    visited.push(key.clone());
+
+    let value = match source.get(&key).map_err(|e| format!("trie read failed: {}", e))? {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    dest.insert(&key, value.clone())
+        .map_err(|e| format!("trie copy failed: {}", e))?;
+
+    // Decode the node to discover child references. The first byte of an
+    // RLP list distinguishes a branch node (0xc0..=0xff, list) from an
+    // extension or leaf node (also a list). Both branch and extension
+    // nodes contain child references as 32-byte hashes. Leaf nodes have
+    // no children.
+    let decoded = rlp::Rlp::new(&value);
+    if !decoded.is_list() {
+        return Ok(());
+    }
+
+    let item_count = decoded.item_count().unwrap_or(0);
+    // Branch nodes have 17 items; extension nodes have 2 items and the
+    // first item is the encoded path, the second is the child hash.
+    // Leaf nodes have 2 items but the second is the value, not a hash.
+    // We copy any 32-byte child reference that resolves to a node.
+    for i in 0..item_count {
+        let child = match decoded.at(i) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let child_data = match child.data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if child_data.len() != 32 {
+            continue;
+        }
+        copy_node(source, child_data, dest, visited)?;
+    }
+
+    Ok(())
+}
+
 // A minimal in-memory DB implementation used by `simulate_apply` so that
 // the simulation never writes to the persistent LevelDB.
-use std::sync::Mutex;
-
 #[derive(Clone, Default)]
 struct MemoryDb {
     inner: Arc<Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
