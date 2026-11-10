@@ -48,7 +48,8 @@ fn block_with_wrong_previous_hash_is_rejected() {
             50_000_000_000,
             chain.nbits,
             Vec::new(),
-        );
+        )
+        .expect("failed to create block in test");
         b.hash = b.calculate_hash();
         let err = validation::validate_block(&mut chain, &prev, &b);
         assert!(err.is_err());
@@ -68,7 +69,8 @@ fn block_with_wrong_index_is_rejected() {
             50_000_000_000,
             chain.nbits,
             Vec::new(),
-        );
+        )
+        .expect("failed to create block in test");
         b.hash = b.calculate_hash();
         let err = validation::validate_block(&mut chain, &prev, &b);
         assert!(err.is_err());
@@ -152,7 +154,8 @@ fn block_total_fees_mismatch_is_rejected() {
             Blockchain::calculate_reward(prev.index + 1),
             chain.nbits,
             Vec::new(),
-        );
+        )
+        .expect("failed to create block in test");
         b.total_fees = 1_000_000;
         b.reward = b.subsidy.saturating_add(b.total_fees);
         b.hash = b.calculate_hash();
@@ -168,8 +171,7 @@ fn block_with_invalid_mined_for_is_rejected() {
     with_temp_datadir(|| {
         let mut chain = Blockchain::new();
         let prev = chain.chain.last().unwrap().clone();
-        
-        // BITCOIN-GRADE: new_for returns Result. Unwrap it for tests.
+
         let mut b = Block::new_for(
             prev.index + 1,
             prev.hash.clone(),
@@ -180,7 +182,8 @@ fn block_with_invalid_mined_for_is_rejected() {
             "not-an-address".to_string(),
             String::new(),
             prev.chainwork,
-        ).expect("failed to create block in test");
+        )
+        .expect("failed to create block in test");
 
         b.hash = b.calculate_hash();
         let err = validation::validate_block(&mut chain, &prev, &b);
@@ -196,8 +199,7 @@ fn block_with_inconsistent_coinbase_is_rejected() {
         let mut chain = Blockchain::new();
         let prev = chain.chain.last().unwrap().clone();
         let addr = dummy_address();
-        
-        // BITCOIN-GRADE: new_for returns Result. Unwrap it for tests.
+
         let mut b = Block::new_for(
             prev.index + 1,
             prev.hash.clone(),
@@ -208,12 +210,71 @@ fn block_with_inconsistent_coinbase_is_rejected() {
             addr.clone(),
             String::new(),
             prev.chainwork,
-        ).expect("failed to create block in test");
+        )
+        .expect("failed to create block in test");
 
         b.coinbase_txid = "00".repeat(32);
         b.hash = b.calculate_hash();
         let err = validation::validate_block(&mut chain, &prev, &b);
         assert!(err.is_err());
         assert_eq!(err.unwrap_err().code, "E048");
+    });
+}
+
+#[test]
+#[serial]
+fn block_with_empty_state_root_is_rejected() {
+    with_temp_datadir(|| {
+        let mut chain = Blockchain::new();
+        let prev = chain.chain.last().unwrap().clone();
+        let addr = dummy_address();
+
+        let mut b = Block::new_for(
+            prev.index + 1,
+            prev.hash.clone(),
+            Blockchain::calculate_reward(prev.index + 1),
+            0,
+            chain.nbits,
+            Vec::new(),
+            addr,
+            String::new(),
+            prev.chainwork,
+        )
+        .expect("failed to create block in test");
+
+        b.state_root = String::new();
+        b.hash = b.calculate_hash();
+        let err = validation::validate_block(&mut chain, &prev, &b);
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, "E052");
+    });
+}
+
+#[test]
+#[serial]
+fn block_with_self_transfer_is_rejected() {
+    with_temp_datadir(|| {
+        let mut chain = Blockchain::new();
+        let prev = chain.chain.last().unwrap().clone();
+        let addr = dummy_address();
+
+        let tx = Transaction::new(&addr, &addr, 1, 0, 0);
+        let mut b = Block::new_for(
+            prev.index + 1,
+            prev.hash.clone(),
+            Blockchain::calculate_reward(prev.index + 1),
+            0,
+            chain.nbits,
+            vec![tx],
+            addr,
+            "00".repeat(32),
+            prev.chainwork,
+        )
+        .expect("failed to create block in test");
+
+        b.hash = b.calculate_hash();
+        let err = validation::validate_block(&mut chain, &prev, &b);
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, "E004");
     });
 }
