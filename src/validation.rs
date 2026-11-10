@@ -202,7 +202,7 @@ pub fn rule_sufficient_balance(chain: &Blockchain, tx: &Transaction) -> Result<(
         return Err(ValidationError::new(
             "E021",
             format!(
-                "insufficient mature balance: required {} sat, available {} sat",
+                "insufficient mature balance: required {} ald, available {} ald",
                 need, balance
             ),
         ));
@@ -320,7 +320,6 @@ pub fn rule_mined_for_valid(block: &Block, chain: &Blockchain) -> Result<(), Val
 }
 
 pub fn rule_block_timestamp_monotonic(prev: &Block, cur: &Block) -> Result<(), ValidationError> {
-    // Rule 1: Timestamp must not be earlier than the previous block.
     if cur.timestamp < prev.timestamp {
         return Err(ValidationError::new(
             "E032",
@@ -331,11 +330,8 @@ pub fn rule_block_timestamp_monotonic(prev: &Block, cur: &Block) -> Result<(), V
         ));
     }
 
-    // Rule 2: Future Time Limit.
-    // Reject blocks whose timestamp is more than 2 hours ahead of the current local time.
-    // This prevents miners from manipulating the timestamp to abuse difficulty adjustments.
     let now = crate::utils::now_millis();
-    let max_future_time = now.saturating_add(2 * 60 * 60 * 1000); // 2 hours in milliseconds
+    let max_future_time = now.saturating_add(2 * 60 * 60 * 1000);
 
     if cur.timestamp > max_future_time {
         return Err(ValidationError::new(
@@ -449,7 +445,7 @@ pub fn rule_total_supply(chain: &Blockchain) -> Result<(), ValidationError> {
         return Err(ValidationError::new(
             "E041",
             format!(
-                "total supply {} sat exceeds the maximum of {} sat",
+                "total supply {} ald exceeds the maximum of {} ald",
                 total, max
             ),
         ));
@@ -559,6 +555,13 @@ pub fn validate_block_transactions(
             continue;
         }
 
+        // Reject self-transfers at the block level. Without this check, a
+        // block could contain a transaction whose sender and recipient are
+        // the same address, which the state layer would process by
+        // overwriting the debited balance with the credited balance and
+        // thereby create coins out of thin air.
+        rule_self_send(tx)?;
+
         let base_nonce = overlay_nonces
             .get(&tx.from)
             .copied()
@@ -582,7 +585,7 @@ pub fn validate_block_transactions(
         if base_balance < need {
             return Err(ValidationError::new(
                 "E021",
-                format!("insufficient mature balance for {}: required {} sat, available {} sat", tx.from, need, base_balance),
+                format!("insufficient mature balance for {}: required {} ald, available {} ald", tx.from, need, base_balance),
             ));
         }
 
@@ -626,7 +629,32 @@ pub fn validate_block(
     rule_block_checkpoint(block)?;
     rule_block_nbits(chain, block)?;
     rule_block_chainwork(prev, block)?;
+    rule_block_state_root_nonempty(block)?;
     validate_block_transactions(chain, &block.transactions, block.index)?;
+    Ok(())
+}
+
+/// Reject any block whose `state_root` is empty. An empty state root can
+/// never be produced by an honest node because every block commits to the
+/// state after applying its transactions. Accepting an empty state root
+/// would let a peer bypass the state-root check in the storage layer and
+/// desynchronise the local state from the block history.
+pub fn rule_block_state_root_nonempty(block: &Block) -> Result<(), ValidationError> {
+    if block.index == 0 {
+        return Ok(());
+    }
+    if block.state_root.is_empty() {
+        return Err(ValidationError::new(
+            "E052",
+            format!("block {} has an empty state root", block.index),
+        ));
+    }
+    if block.state_root.len() != 64 || !block.state_root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ValidationError::new(
+            "E052",
+            format!("block {} has a malformed state root", block.index),
+        ));
+    }
     Ok(())
 }
 
@@ -739,6 +767,10 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
             if !crate::blockchain::checkpoint::verify(cur.index, &cur.hash) {
                 return Err(ValidationError::new("E038",
                     format!("block {} violates a checkpoint", cur_index)));
+            }
+            if cur.state_root.is_empty() || cur.state_root.len() != 64 {
+                return Err(ValidationError::new("E052",
+                    format!("block {} has an empty or malformed state root", cur_index)));
             }
         }
         let expected_subsidy = Blockchain::calculate_reward(cur_index);
