@@ -102,7 +102,7 @@ pub const REGTEST_GENESIS_TIMESTAMP: u128 = 1792303198447;
 // GENESIS_OUTPUT_SCRIPT. Run `xepay-genesis -regtest` and paste the
 // output here.
 pub const REGTEST_EXPECTED_GENESIS_HASH: &str =
-    "PLACEHOLDER_RUN_XEPAY_GENESIS_REGTEST";
+    "7a27c622e79ec9d6862548e7993d89d177b81eb05cd4c4c90e326a170e7e9fb0";
 
 // The expected regtest genesis merkle root.
 pub const REGTEST_EXPECTED_GENESIS_MERKLE_ROOT: &str =
