@@ -35,7 +35,8 @@ fn mining_produces_valid_hash() {
         blockchain::initial_reward(),
         nbits,
         vec![Transaction::new("XEPC_alice", "XEPC_bob", 1, 0, 0)],
-    );
+    )
+    .expect("failed to create block");
     let ok = mine(&mut b, nbits);
     assert!(ok);
     assert!(hash_meets_nbits(&b.hash, nbits));
@@ -51,7 +52,8 @@ fn mining_increments_nonce() {
         blockchain::initial_reward(),
         nbits,
         vec![Transaction::new("XEPC_alice", "XEPC_bob", 1, 0, 0)],
-    );
+    )
+    .expect("failed to create block");
     let n0 = b.nonce;
     let ok = mine(&mut b, nbits);
     assert!(ok);
