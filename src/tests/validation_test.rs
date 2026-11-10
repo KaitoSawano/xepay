@@ -255,25 +255,14 @@ fn block_with_empty_state_root_is_rejected() {
 fn block_with_self_transfer_is_rejected() {
     with_temp_datadir(|| {
         let mut chain = Blockchain::new();
-        let prev = chain.chain.last().unwrap().clone();
         let addr = dummy_address();
 
         let tx = Transaction::new(&addr, &addr, 1, 0, 0);
-        let mut b = Block::new_for(
-            prev.index + 1,
-            prev.hash.clone(),
-            Blockchain::calculate_reward(prev.index + 1),
-            0,
-            chain.nbits,
-            vec![tx],
-            addr,
-            "00".repeat(32),
-            prev.chainwork,
-        )
-        .expect("failed to create block in test");
 
-        b.hash = b.calculate_hash();
-        let err = validation::validate_block(&mut chain, &prev, &b);
+        // Validate the transaction list directly. This isolates the
+        // self-transfer rule from the proof-of-work rule, which cannot
+        // succeed under the `skip-pow` test feature.
+        let err = validation::validate_block_transactions(&mut chain, &[tx], 1);
         assert!(err.is_err());
         assert_eq!(err.unwrap_err().code, "E004");
     });
