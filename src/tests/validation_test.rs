@@ -14,7 +14,7 @@ use xepay::validation;
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 fn with_temp_datadir<F: FnOnce()>(f: F) {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir failed");
     std::env::set_var("XEPC_DATADIR", dir.path());
     f();
