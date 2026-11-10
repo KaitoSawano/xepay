@@ -91,44 +91,35 @@ impl Block {
     pub fn compute_work(nbits: u32) -> u128 {
         let target = pow::nbits_to_target(nbits);
 
-        // chainwork = 2^256 / (target + 1).
-        //
-        // Since chainwork is stored as u128 (not u256), we must handle
-        // targets that exceed u128::MAX. A target larger than u128::MAX
-        // means the difficulty is trivially low, so the work contributed
-        // by the block is the minimum possible (1).
-        //
-        // The first 16 bytes of the target are the most significant.
-        // If any of them is non-zero, the target is > u128::MAX.
         for &b in &target[0..16] {
             if b != 0 {
                 return 1;
             }
         }
 
-        // Read the lower 16 bytes of the target.
         let mut target_u128: u128 = 0;
         for &b in &target[16..32] {
             target_u128 = (target_u128 << 8) | (b as u128);
         }
 
-        // If the target is zero, the work is maximal. This should never
-        // happen for a valid nbits because validation rejects it.
         if target_u128 == 0 {
             return u128::MAX;
         }
 
-        // chainwork = u128::MAX / (target + 1).
         u128::MAX / (target_u128.saturating_add(1))
     }
 
+    /// Build a block with zero subsidy, zero fees, and no reward. This
+    /// wrapper returns a `Result` instead of panicking so that callers
+    /// that receive untrusted data (for example, a peer message) can
+    /// handle the error without crashing the node.
     pub fn new(
         index: u64,
         previous_hash: String,
         reward: u64,
         nbits: u32,
         transactions: Vec<Transaction>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::new_for(
             index,
             previous_hash,
@@ -140,7 +131,6 @@ impl Block {
             String::new(),
             0,
         )
-        .expect("failed to create block in Block::new")
     }
 
     pub fn new_for(
