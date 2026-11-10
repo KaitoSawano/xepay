@@ -609,12 +609,11 @@ impl RpcHandler {
             (prev.hash.clone(), prev.chainwork, c.nbits)
         };
 
-        let total_fees: u64 = c.mempool.iter().map(|tx| tx.fee).sum();
+        let mempool_snapshot = c.mempool.clone();
+        let total_fees: u64 = mempool_snapshot.iter().map(|tx| tx.fee).sum();
         let reward = subsidy.saturating_add(total_fees);
 
-        // Simulate the mempool on a read-only in-memory overlay. The
-        // persistent state database is never modified by this call.
-        let state_root = match c.state.simulate_apply(&c.mempool) {
+        let state_root = match c.state.simulate_apply(&mempool_snapshot) {
             Ok(root) => hex::encode(root),
             Err(e) => {
                 return RpcResponse::err(&format!(
@@ -623,8 +622,6 @@ impl RpcHandler {
                 ))
             }
         };
-
-        let mempool_snapshot = c.mempool.clone();
 
         RpcResponse::ok(json!({
             "height": next_height,
