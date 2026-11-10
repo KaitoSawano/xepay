@@ -360,7 +360,7 @@ impl RpcHandler {
             "getnetworkinfo" => self.m_getnetworkinfo(),
             "getpeerinfo" => self.m_getpeerinfo(),
             "getcheckpoints" => m_getcheckpoints(),
-            "getblocktemplate" => self.m_getblocktemplate(),
+            "getblocktemplate" => self.m_getblocktemplate(req),
             "submitblock" => self.m_submitblock(req),
             "getbalance" => self.m_getbalance(req),
             "getblockhash" => self.m_getblockhash(req),
@@ -599,8 +599,22 @@ impl RpcHandler {
         }))
     }
 
-    fn m_getblocktemplate(&self) -> RpcResponse {
+    fn m_getblocktemplate(&self, req: &RpcRequest) -> RpcResponse {
+        let mining_address = match req.params.first().and_then(|v| v.as_str()) {
+            Some(a) => a.to_string(),
+            None => {
+                return RpcResponse::err(
+                    "getblocktemplate requires a mining address as the first parameter",
+                )
+            }
+        };
+
         let mut c = self.state.chain.blocking_write();
+
+        if !validation::is_valid_address(&mining_address, &c) {
+            return RpcResponse::err("invalid mining address format");
+        }
+
         let next_height = c.height() + 1;
         let subsidy = Blockchain::calculate_reward(next_height);
 
@@ -611,10 +625,23 @@ impl RpcHandler {
 
         let mempool_snapshot = c.mempool.clone();
         let total_fees: u64 = mempool_snapshot.iter().map(|tx| tx.fee).sum();
-        let reward = subsidy.saturating_add(total_fees);
+        let reward = match subsidy.checked_add(total_fees) {
+            Some(v) => v,
+            None => return RpcResponse::err("block reward overflow"),
+        };
 
-        let addresses = c.addresses.clone();
-        let state_root = match c.state.simulate_apply(&addresses, &mempool_snapshot) {
+        let mut addresses = c.addresses.clone();
+        if !addresses.contains(&mining_address) {
+            addresses.push(mining_address.clone());
+        }
+
+        let state_root = match c.state.simulate_apply(
+            &addresses,
+            &mempool_snapshot,
+            &mining_address,
+            reward,
+            next_height,
+        ) {
             Ok(root) => hex::encode(root),
             Err(e) => {
                 return RpcResponse::err(&format!(
@@ -630,6 +657,7 @@ impl RpcHandler {
             "previous_chainwork": previous_chainwork.to_string(),
             "nbits": nbits,
             "state_root": state_root,
+            "mining_address": mining_address,
             "reward_xepc": to_coin(reward),
             "reward_ald": to_aldian(reward),
             "subsidy_xepc": to_coin(subsidy),
@@ -690,6 +718,20 @@ impl RpcHandler {
             return RpcResponse::err(&format!("failed to credit reward: {}", e));
         }
 
+        let actual_root = match chain.state.root_hash() {
+            Ok(root) => hex::encode(root),
+            Err(e) => {
+                return RpcResponse::err(&format!("failed to compute state root: {}", e))
+            }
+        };
+
+        if actual_root != block.state_root {
+            return RpcResponse::err(&format!(
+                "block rejected: state root mismatch (declared {}, computed {})",
+                block.state_root, actual_root
+            ));
+        }
+
         chain.chain.push(block.clone());
         chain.adjust_difficulty();
         chain.mempool.clear();
@@ -716,6 +758,7 @@ impl RpcHandler {
             "mined_at": block.mined_at,
             "mined_for": block.mined_for,
             "nbits": block.nbits,
+            "state_root": block.state_root,
         }))
     }
 
