@@ -608,37 +608,9 @@ pub fn validate_block_transactions(
     Ok(())
 }
 
-pub fn validate_block(
-    chain: &mut Blockchain,
-    prev: &Block,
-    block: &Block,
-) -> Result<(), ValidationError> {
-    rule_block_version(block)?;
-    rule_block_index_sequential(prev, block)?;
-    rule_block_hash_consistent(block)?;
-    rule_block_previous_hash(prev, block)?;
-    rule_block_merkle_root(block)?;
-    rule_block_subsidy(block)?;
-    rule_block_total_fees(block)?;
-    rule_block_reward(block)?;
-    rule_block_coinbase_consistent(block)?;
-    rule_mined_for_valid(block, chain)?;
-    rule_block_pow(block)?;
-    rule_block_tx_count(block)?;
-    rule_block_timestamp_monotonic(prev, block)?;
-    rule_block_checkpoint(block)?;
-    rule_block_nbits(chain, block)?;
-    rule_block_chainwork(prev, block)?;
-    rule_block_state_root_nonempty(block)?;
-    validate_block_transactions(chain, &block.transactions, block.index)?;
-    Ok(())
-}
-
-/// Reject any block whose `state_root` is empty. An empty state root can
-/// never be produced by an honest node because every block commits to the
-/// state after applying its transactions. Accepting an empty state root
-/// would let a peer bypass the state-root check in the storage layer and
-/// desynchronise the local state from the block history.
+/// Reject any block whose `state_root` is empty or malformed. An empty
+/// state root can never be produced by an honest node because every
+/// block commits to the state after applying its transactions.
 pub fn rule_block_state_root_nonempty(block: &Block) -> Result<(), ValidationError> {
     if block.index == 0 {
         return Ok(());
@@ -670,6 +642,35 @@ pub fn rule_block_chainwork(prev: &Block, cur: &Block) -> Result<(), ValidationE
             ),
         ));
     }
+    Ok(())
+}
+
+pub fn validate_block(
+    chain: &mut Blockchain,
+    prev: &Block,
+    block: &Block,
+) -> Result<(), ValidationError> {
+    rule_block_version(block)?;
+    rule_block_index_sequential(prev, block)?;
+    rule_block_hash_consistent(block)?;
+    rule_block_previous_hash(prev, block)?;
+    rule_block_merkle_root(block)?;
+    rule_block_subsidy(block)?;
+    rule_block_total_fees(block)?;
+    rule_block_reward(block)?;
+    rule_block_coinbase_consistent(block)?;
+    rule_mined_for_valid(block, chain)?;
+    // Validate the state root before the proof of work so that a block
+    // with a structural defect is rejected without spending time on the
+    // hash check.
+    rule_block_state_root_nonempty(block)?;
+    rule_block_pow(block)?;
+    rule_block_tx_count(block)?;
+    rule_block_timestamp_monotonic(prev, block)?;
+    rule_block_checkpoint(block)?;
+    rule_block_nbits(chain, block)?;
+    rule_block_chainwork(prev, block)?;
+    validate_block_transactions(chain, &block.transactions, block.index)?;
     Ok(())
 }
 
