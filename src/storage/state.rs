@@ -133,15 +133,20 @@ impl StateDB {
         })
     }
 
-    /// Simulate applying a list of transactions and return the state root
-    /// that would result. The simulation builds an in-memory copy of the
-    /// current trie from the supplied address list, applies the
-    /// transactions to that copy, and reads its root. The persistent
-    /// database is never written to, so the live state is not affected.
+    /// Simulate applying a list of transactions and crediting the block
+    /// reward, then return the state root that would result. The
+    /// simulation builds an in-memory copy of the current trie from the
+    /// supplied address list, applies the transactions to that copy,
+    /// credits the reward to the miner, and reads the resulting root.
+    /// The persistent database is never written to, so the live state is
+    /// not affected.
     pub fn simulate_apply(
         &self,
         addresses: &[String],
         transactions: &[crate::transaction::Transaction],
+        miner: &str,
+        reward: u64,
+        block_height: u64,
     ) -> Result<[u8; 32], String> {
         let memory_db = Arc::new(MemoryDb::new());
         let mut temp_trie = EthTrie::new(memory_db.clone());
@@ -213,6 +218,14 @@ impl StateDB {
                 .insert(&to_key, &to_value)
                 .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
         }
+
+        credit_reward_on_trie(
+            &mut temp_trie,
+            miner,
+            reward,
+            block_height,
+            crate::consensus::rules::COINBASE_MATURITY,
+        )?;
 
         let root = temp_trie
             .root_hash()
@@ -439,6 +452,39 @@ fn read_account_from_trie<D: DB>(
         }
         None => Ok(None),
     }
+}
+
+/// Apply a block reward to the miner account in the given trie. This
+/// mirrors `StateDB::credit_reward` but operates on any trie, which
+/// allows the simulation to use an in-memory trie.
+fn credit_reward_on_trie<D: DB>(
+    trie: &mut EthTrie<D>,
+    miner: &str,
+    reward: u64,
+    block_height: u64,
+    maturity: u64,
+) -> Result<(), String> {
+    let key = keccak(miner.as_bytes()).0;
+    let mut acc = read_account_from_trie(trie, &key)?.unwrap_or_else(empty_account);
+
+    let mut still_immature = Vec::new();
+    for (height, amount) in acc.immature_rewards.drain(..) {
+        if block_height >= height.saturating_add(maturity) {
+            acc.balance = acc
+                .balance
+                .checked_add(amount)
+                .ok_or_else(|| "balance overflow during maturity".to_string())?;
+        } else {
+            still_immature.push((height, amount));
+        }
+    }
+    acc.immature_rewards = still_immature;
+    acc.immature_rewards.push((block_height, reward));
+
+    let value = rlp::encode(&acc).to_vec();
+    trie.insert(&key, &value)
+        .map_err(|e| format!("failed to credit reward in simulation: {}", e))?;
+    Ok(())
 }
 
 // A minimal in-memory DB implementation used by `simulate_apply` so that
