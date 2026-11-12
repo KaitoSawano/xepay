@@ -7,6 +7,7 @@
 mod bug_regression_test;
 mod coin_creation_test;
 mod difficulty_test;
+mod dynamic_fee_test;
 mod genesis_test;
 mod halving_test;
 mod hash_test;

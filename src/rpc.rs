@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::consensus;
 use crate::consensus::spec::Network;
 use crate::datadir;
-use crate::hdwallet::{AddressType, HdWallet, HdAddressEntry};
+use crate::dilithium::{address, keypair::KeyPair};
 use crate::p2p::network::{NetworkCommand, PeerRegistry};
 use crate::pow;
 use crate::storage;
@@ -376,7 +376,6 @@ impl RpcHandler {
             "getlistwallet" => m_getlistwallet(self.state.chain.clone()),
             "dumpprivkey" => m_dumpprivkey(req),
             "dumpwallet" => m_dumpwallet(),
-            "migratewallet" => self.m_migratewallet(),
             "importprivkey" => m_importprivkey(req),
             "getcreatewallet" => self.m_getcreatewallet(),
             "getcreatewalletbech32" => self.m_getcreatewalletbech32(),
@@ -396,13 +395,6 @@ impl RpcHandler {
             "getmempoolinfo" => self.m_getmempoolinfo(),
             "validatemempool" => self.m_validatemempool(),
             "getnonce" => self.m_getnonce(req),
-
-            "createhdwallet" => self.m_createhdwallet(req),
-            "loadhdwallet" => self.m_loadhdwallet(),
-            "restorehdwallet" => self.m_restorehdwallet(req),
-            "dumphdmnemonic" => self.m_dumphdmnemonic(),
-            "derivehdaddress" => self.m_derivehdaddress(req),
-            "listhdaddresses" => self.m_listhdaddresses(),
 
             _ => RpcResponse::err("unknown method"),
         }
@@ -1025,8 +1017,8 @@ impl RpcHandler {
                         "fee_rate": blockchain::Blockchain::fee_rate(tx),
                         "nonce": tx.nonce,
                         "note": tx.note,
-                        "public_key": tx.public_key,
-                        "signature": tx.signature,
+                        "public_key": hex::encode(&tx.public_key),
+                        "signature": hex::encode(&tx.signature),
                         "output_script": tx.output_script,
                         "in_mempool": false,
                         "block_hash": block.hash,
@@ -1069,8 +1061,8 @@ impl RpcHandler {
                     "fee_rate": blockchain::Blockchain::fee_rate(tx),
                     "nonce": tx.nonce,
                     "note": tx.note,
-                    "public_key": tx.public_key,
-                    "signature": tx.signature,
+                    "public_key": hex::encode(&tx.public_key),
+                    "signature": hex::encode(&tx.signature),
                     "output_script": tx.output_script,
                     "in_mempool": true,
                 }));
@@ -1101,8 +1093,8 @@ impl RpcHandler {
                         "fee_rate": blockchain::Blockchain::fee_rate(tx),
                         "nonce": tx.nonce,
                         "note": tx.note,
-                        "public_key": tx.public_key,
-                        "signature": tx.signature,
+                        "public_key": hex::encode(&tx.public_key),
+                        "signature": hex::encode(&tx.signature),
                         "block_hash": block.hash,
                         "block_height": block.index,
                     }));
@@ -1123,8 +1115,8 @@ impl RpcHandler {
                     "fee_rate": blockchain::Blockchain::fee_rate(tx),
                     "nonce": tx.nonce,
                     "note": tx.note,
-                    "public_key": tx.public_key,
-                    "signature": tx.signature,
+                    "public_key": hex::encode(&tx.public_key),
+                    "signature": hex::encode(&tx.signature),
                     "in_mempool": true,
                 }));
             }
@@ -1384,14 +1376,23 @@ impl RpcHandler {
             }
         }
 
-        let estimated_tx_size: u64 = 250;
+        // Estimate transaction size based on the new raw byte format.
+        // 2 inputs (from/to) + amount + fee + nonce + signature + public key + overhead.
+        let estimated_tx_size: u64 = 5_400; 
+        
         let fee: u64 = if let Some(custom) = req.params.get(3).and_then(|v| v.as_u64()) {
             if custom == 0 {
                 return RpcResponse::err("fee must be greater than zero");
             }
             custom
         } else {
-            (blockchain::MIN_RELAY_FEE_PER_BYTE * estimated_tx_size).max(DEFAULT_FEE_XEPC)
+            // Ask the chain for the current dynamic minimum fee
+            let chain = self.state.chain.blocking_read();
+            let dynamic_min_fee_rate = chain.current_min_fee_per_byte();
+            drop(chain);
+            
+            // Calculate fee based on dynamic rate and estimated size
+            (dynamic_min_fee_rate * estimated_tx_size).max(DEFAULT_FEE_XEPC)
         };
 
         let amount_ald: u64 = if is_sendall {
@@ -1506,7 +1507,7 @@ impl RpcHandler {
         let mut chain = self.state.chain.blocking_write();
         if !chain.add_transaction(tx.clone()) {
             return RpcResponse::err(
-                "transaction rejected by mempool (RBF, eviction, or min relay fee)",
+                "transaction rejected by mempool (RBF, eviction, or dynamic min relay fee)",
             );
         }
 
@@ -1613,8 +1614,8 @@ impl RpcHandler {
             }
         }
 
-        let kp = crate::secp256k1::keypair::KeyPair::generate().expect("keypair generation failed");
-        let address = crate::secp256k1::address::address_from_public_key_bech32(&kp.public_key)
+        let kp = KeyPair::generate().expect("keypair generation failed");
+        let address = address::address_from_public_key_bech32(&kp.public_key)
             .expect("bech32 address generation failed");
 
         let entry = WalletEntry {
@@ -1659,179 +1660,6 @@ impl RpcHandler {
                 }))
             }
             Err(e) => RpcResponse::err(&format!("failed to decrypt wallet: {}", e)),
-        }
-    }
-
-    fn m_migratewallet(&mut self) -> RpcResponse {
-        let legacy_wallet = match Wallet::load_default() {
-            Ok(w) => w,
-            Err(e) => return RpcResponse::err(&format!("failed to load legacy wallet: {}", e)),
-        };
-
-        if legacy_wallet.entries.is_empty() {
-            return RpcResponse::err("legacy wallet has no addresses to migrate");
-        }
-
-        let wallet_path = datadir::wallet_path();
-        let timestamp = now_millis();
-        let backup_name = format!("wallet.dat.bak.{}", timestamp);
-        let backup_path = datadir::datadir().join(&backup_name);
-
-        if wallet_path.exists() {
-            if let Err(e) = std::fs::copy(&wallet_path, &backup_path) {
-                return RpcResponse::err(&format!("failed to backup wallet.dat: {}", e));
-            }
-        } else {
-            return RpcResponse::err("wallet.dat not found on disk");
-        }
-
-        let mut hd_wallet = match HdWallet::load_default() {
-            Ok(w) => w,
-            Err(_) => match HdWallet::generate(12) {
-                Ok(w) => w,
-                Err(e) => return RpcResponse::err(&format!("failed to create HD wallet: {}", e)),
-            },
-        };
-
-        let mut imported = 0;
-        let mut skipped = 0;
-        for entry in &legacy_wallet.entries {
-            let hd_entry = HdAddressEntry {
-                address: entry.address.clone(),
-                public_key: entry.public_key.clone(),
-                secret: entry.secret.clone(),
-                path: "migrated".to_string(),
-                index: 0,
-                address_type: if entry.address.starts_with(&format!("{}1", crate::blockchain::bech32_hrp())) {
-                    AddressType::Bech32
-                } else {
-                    AddressType::Legacy
-                },
-                created_at: now_millis(),
-            };
-
-            match hd_wallet.import_entry(hd_entry) {
-                Ok(_) => imported += 1,
-                Err(_) => skipped += 1,
-            }
-        }
-
-        if let Err(e) = hd_wallet.save_default() {
-            return RpcResponse::err(&format!("failed to save HD wallet: {}", e));
-        }
-
-        RpcResponse::ok(json!({
-            "migrated": true,
-            "backup_file": backup_name,
-            "imported_count": imported,
-            "skipped_count": skipped,
-            "hd_wallet_total_entries": hd_wallet.entries.len(),
-            "message": "Legacy wallet migrated to HD wallet. Backup created.",
-        }))
-    }
-
-    fn m_createhdwallet(&mut self, req: &RpcRequest) -> RpcResponse {
-        let word_count = req.params.first().and_then(|v| v.as_u64()).unwrap_or(12) as usize;
-        match HdWallet::generate(word_count) {
-            Ok(wallet) => {
-                if let Err(e) = wallet.save_default() {
-                    return RpcResponse::err(&format!("failed to save HD wallet: {}", e));
-                }
-                RpcResponse::ok(json!({
-                    "mnemonic": wallet.mnemonic,
-                    "word_count": word_count,
-                    "saved_to": HdWallet::default_path().to_string_lossy().to_string(),
-                }))
-            }
-            Err(e) => RpcResponse::err(&e),
-        }
-    }
-
-    fn m_loadhdwallet(&self) -> RpcResponse {
-        match HdWallet::load_default() {
-            Ok(wallet) => RpcResponse::ok(json!({
-                "mnemonic": wallet.mnemonic,
-                "entries": wallet.entries,
-                "created_at": wallet.created_at,
-            })),
-            Err(e) => RpcResponse::err(&format!("failed to load HD wallet: {}", e)),
-        }
-    }
-
-    fn m_restorehdwallet(&mut self, req: &RpcRequest) -> RpcResponse {
-        let phrase = match req.params.first().and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => return RpcResponse::err("restorehdwallet requires a mnemonic phrase"),
-        };
-        let passphrase = req.params.get(1).and_then(|v| v.as_str());
-        match HdWallet::from_mnemonic(&phrase, passphrase) {
-            Ok(wallet) => {
-                if let Err(e) = wallet.save_default() {
-                    return RpcResponse::err(&format!("failed to save HD wallet: {}", e));
-                }
-                RpcResponse::ok(json!({
-                    "restored": true,
-                    "word_count": wallet.mnemonic.split_whitespace().count(),
-                }))
-            }
-            Err(e) => RpcResponse::err(&e),
-        }
-    }
-
-    fn m_dumphdmnemonic(&self) -> RpcResponse {
-        match HdWallet::load_default() {
-            Ok(wallet) => RpcResponse::ok(json!({
-                "mnemonic": wallet.mnemonic,
-                "passphrase": wallet.passphrase,
-            })),
-            Err(e) => RpcResponse::err(&format!("failed to load HD wallet: {}", e)),
-        }
-    }
-
-    fn m_derivehdaddress(&mut self, req: &RpcRequest) -> RpcResponse {
-        let index = match req.params.first().and_then(|v| v.as_u64()) {
-            Some(i) => i as u32,
-            None => return RpcResponse::err("derivehdaddress requires an index"),
-        };
-        let addr_type_str = req.params.get(1).and_then(|v| v.as_str()).unwrap_or("legacy");
-        let addr_type = match AddressType::from_str(addr_type_str) {
-            Some(t) => t,
-            None => return RpcResponse::err("invalid address type, must be 'legacy' or 'bech32'"),
-        };
-
-        let mut wallet = match HdWallet::load_default() {
-            Ok(w) => w,
-            Err(e) => return RpcResponse::err(&format!("failed to load HD wallet: {}", e)),
-        };
-
-        match wallet.derive_address(index, addr_type) {
-            Ok(entry) => {
-                if let Err(e) = wallet.save_default() {
-                    return RpcResponse::err(&format!("failed to save HD wallet: {}", e));
-                }
-                RpcResponse::ok(json!({
-                    "address": entry.address,
-                    "public_key": entry.public_key,
-                    "path": entry.path,
-                    "index": entry.index,
-                    "address_type": match entry.address_type {
-                        AddressType::Legacy => "legacy",
-                        AddressType::Bech32 => "bech32",
-                    },
-                }))
-            }
-            Err(e) => RpcResponse::err(&e),
-        }
-    }
-
-    fn m_listhdaddresses(&self) -> RpcResponse {
-        match HdWallet::load_default() {
-            Ok(wallet) => RpcResponse::ok(json!({
-                "mnemonic": wallet.mnemonic,
-                "entries": wallet.entries,
-                "count": wallet.entries.len(),
-            })),
-            Err(e) => RpcResponse::err(&format!("failed to load HD wallet: {}", e)),
         }
     }
 }
@@ -1962,17 +1790,17 @@ fn m_importprivkey(req: &RpcRequest) -> RpcResponse {
         Err(e) => return RpcResponse::err(&format!("invalid hex: {}", e)),
     };
 
-    let kp = match crate::secp256k1::keypair::KeyPair::from_secret(&bytes) {
+    let kp = match KeyPair::from_secret(&bytes) {
         Ok(k) => k,
         Err(e) => return RpcResponse::err(&format!("invalid private key: {}", e)),
     };
 
-    let legacy_addr = match crate::secp256k1::address::address_from_public_key(&kp.public_key) {
+    let legacy_addr = match address::address_from_public_key(&kp.public_key) {
         Ok(a) => a,
         Err(e) => return RpcResponse::err(&format!("failed to generate legacy address: {}", e)),
     };
 
-    let bech32_addr = match crate::secp256k1::address::address_from_public_key_bech32(&kp.public_key) {
+    let bech32_addr = match address::address_from_public_key_bech32(&kp.public_key) {
         Ok(a) => a,
         Err(e) => return RpcResponse::err(&format!("failed to generate bech32 address: {}", e)),
     };

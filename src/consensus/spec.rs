@@ -133,7 +133,7 @@ pub const VERSION: &str = "0.1.0";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const HASH_ALGO: &str = "SHA3-256";
-pub const SIGNATURE_ALGO: &str = "secp256k1-ECDSA";
+pub const SIGNATURE_ALGO: &str = "ML-DSA-65";
 pub const DECIMALS: u32 = 8;
 
 /// The number of Aldian in one XEPC.
@@ -168,7 +168,7 @@ pub const DEFAULT_RPC_PORT_MAIN: u16 = 7554;
 pub const DATADIR_NAME_MAIN: &str = ".xepay";
 pub const GENESIS_TIMESTAMP_MAIN: u128 = 1792303198445;
 pub const GENESIS_NBITS_MAIN: u32 = 0x1e0ffff0;
-pub const EXPECTED_GENESIS_NONCE_MAIN: u64 = 1330404;
+pub const EXPECTED_GENESIS_NONCE_MAIN: u64 = 0;
 
 // ----------------------------------------------------------------------
 // Testnet parameters
@@ -180,7 +180,7 @@ pub const DEFAULT_RPC_PORT_TEST: u16 = 12254;
 pub const DATADIR_NAME_TEST: &str = ".xepay-testnet";
 pub const GENESIS_TIMESTAMP_TEST: u128 = 1792303198446;
 pub const GENESIS_NBITS_TEST: u32 = 0x1e0ffff0;
-pub const EXPECTED_GENESIS_NONCE_TEST: u64 = 464818;
+pub const EXPECTED_GENESIS_NONCE_TEST: u64 = 0;
 
 // ----------------------------------------------------------------------
 // Regtest parameters
@@ -192,7 +192,7 @@ pub const DEFAULT_RPC_PORT_REGTEST: u16 = 18443;
 pub const DATADIR_NAME_REGTEST: &str = ".xepay-regtest";
 pub const GENESIS_TIMESTAMP_REGTEST: u128 = 1792303198447;
 pub const GENESIS_NBITS_REGTEST: u32 = 0x207fffff;
-pub const EXPECTED_GENESIS_NONCE_REGTEST: u64 = 2;
+pub const EXPECTED_GENESIS_NONCE_REGTEST: u64 = 0;
 
 // ----------------------------------------------------------------------
 // Legacy accessors

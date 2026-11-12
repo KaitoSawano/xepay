@@ -8,7 +8,7 @@
 pub const COINBASE_MATURITY: u64 = 100;
 
 // The maximum number of transactions allowed in a single block.
-pub const MAX_TX_PER_BLOCK: usize = 10_000;
+pub const MAX_TX_PER_BLOCK: usize = 1_000;
 
 // The maximum number of inputs per transaction (unused in the account-based model).
 pub const MAX_INPUTS_PER_TX: usize = 1_000;

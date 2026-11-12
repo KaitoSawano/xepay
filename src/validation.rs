@@ -8,8 +8,8 @@ use crate::block::Block;
 use crate::blockchain::Blockchain;
 use crate::consensus::rules;
 use crate::consensus::spec::{self, Network};
+use crate::dilithium::{address, verify};
 use crate::pow;
-use crate::secp256k1::{address, verify};
 use crate::transaction::Transaction;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -113,13 +113,15 @@ pub fn rule_signature(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.signature.is_empty() {
         return Err(ValidationError::new("E010", "signature is empty"));
     }
-    let pk = hex::decode(&tx.public_key)
-        .map_err(|_| ValidationError::new("E010", "public key is not hexadecimal"))?;
-    let sig = hex::decode(&tx.signature)
-        .map_err(|_| ValidationError::new("E010", "signature is not hexadecimal"))?;
+    
+    // public_key dan signature sekarang berupa byte mentah (Vec<u8>).
+    let pk = &tx.public_key;
+    let sig = &tx.signature;
+    
     let msg = hex::decode(tx.signing_hash())
         .map_err(|_| ValidationError::new("E010", "signing hash is not hexadecimal"))?;
-    if !verify::verify(&pk, &msg, &sig) {
+        
+    if !verify::verify(pk, &msg, sig) {
         return Err(ValidationError::new(
             "E010",
             format!("signature is invalid for txid {}", tx.txid),
@@ -135,16 +137,16 @@ pub fn rule_address_matches_pubkey(tx: &Transaction) -> Result<(), ValidationErr
     if tx.public_key.is_empty() {
         return Err(ValidationError::new("E011", "public key is empty"));
     }
-    let pk = hex::decode(&tx.public_key)
-        .map_err(|_| ValidationError::new("E011", "public key is not hexadecimal"))?;
+    
+    let pk = &tx.public_key;
 
     let hrp = crate::blockchain::bech32_hrp();
     let expected = if tx.from.starts_with(&format!("{}1", hrp)) {
-        address::address_from_public_key_bech32(&pk).map_err(|_| {
+        address::address_from_public_key_bech32(pk).map_err(|_| {
             ValidationError::new("E011", "public key cannot be converted to a bech32 address")
         })?
     } else {
-        address::address_from_public_key(&pk).map_err(|_| {
+        address::address_from_public_key(pk).map_err(|_| {
             ValidationError::new("E011", "public key cannot be converted to a legacy address")
         })?
     };

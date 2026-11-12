@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use xepay_crypto::sha3_256_hex;
 
 use crate::consensus::spec;
-use crate::secp256k1::address;
+use crate::dilithium::address;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -19,8 +19,13 @@ pub struct Transaction {
     pub fee: u64,
     pub nonce: u64,
     pub note: String,
-    pub public_key: String,
-    pub signature: String,
+    /// Raw ML-DSA-65 public key (1952 bytes). Stored as bytes, not hex,
+    /// so the transaction size is not doubled by hex encoding.
+    #[serde(default)]
+    pub public_key: Vec<u8>,
+    /// Raw ML-DSA-65 signature (3309 bytes). Stored as bytes, not hex.
+    #[serde(default)]
+    pub signature: Vec<u8>,
     pub output_script: String,
 }
 
@@ -45,8 +50,8 @@ impl Transaction {
             fee,
             nonce,
             note,
-            public_key: String::new(),
-            signature: String::new(),
+            public_key: Vec::new(),
+            signature: Vec::new(),
             output_script: String::new(),
         }
         .finalize()
@@ -66,8 +71,8 @@ impl Transaction {
             fee: 0,
             nonce: 0,
             note,
-            public_key: String::new(),
-            signature: String::new(),
+            public_key: Vec::new(),
+            signature: Vec::new(),
             output_script: String::new(),
         }
         .finalize()
@@ -82,8 +87,8 @@ impl Transaction {
             fee: 0,
             nonce: 0,
             note,
-            public_key: String::new(),
-            signature: String::new(),
+            public_key: Vec::new(),
+            signature: Vec::new(),
             output_script: String::new(),
         }
         .finalize()
@@ -94,23 +99,25 @@ impl Transaction {
     /// The txid is a hash of every field that affects the transaction's
     /// validity, including `public_key` and `output_script`. This ensures
     /// that any change to the transaction produces a different txid, which
-    /// prevents txid malleability. Reference node implementations follow
-    /// the same principle: the txid commits to the full transaction data,
-    /// including the script that carries the public key.
+    /// prevents txid malleability.
+    ///
+    /// `public_key` and `signature` are hashed as raw bytes, not as hex.
+    /// This keeps the txid independent of the encoding used for storage.
     pub fn compute_txid(&self) -> String {
-        let payload = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.from,
-            self.to,
-            self.amount,
-            self.fee,
-            self.nonce,
-            self.note,
-            self.public_key,
-            self.signature,
-            self.output_script,
-        );
-        sha3_256_hex(payload.as_bytes())
+        let mut payload = Vec::new();
+        payload.extend_from_slice(self.from.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.to.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.amount.to_be_bytes());
+        payload.extend_from_slice(&self.fee.to_be_bytes());
+        payload.extend_from_slice(&self.nonce.to_be_bytes());
+        payload.extend_from_slice(self.note.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.public_key);
+        payload.extend_from_slice(&self.signature);
+        payload.extend_from_slice(self.output_script.as_bytes());
+        sha3_256_hex(&payload)
     }
 
     pub fn signing_hash(&self) -> String {
@@ -136,25 +143,21 @@ impl Transaction {
     ///   3. Set `signature`.
     ///   4. Compute `txid` **after** `public_key` and `signature` are set,
     ///      so that the txid commits to the full transaction data.
-    ///
-    /// This mirrors the behaviour of reference node implementations,
-    /// where `SignatureHash()` is computed before the signature is
-    /// written, and `GetHash()` is computed after all fields are set.
     pub fn sign(&mut self, secret_hex: &str) -> Result<(), String> {
-        use crate::secp256k1::{keypair::KeyPair, sign};
+        use crate::dilithium::{keypair::KeyPair, sign};
 
         let sk = hex::decode(secret_hex).map_err(|e| e.to_string())?;
         let kp = KeyPair::from_secret(&sk)?;
 
-        // Step 1: set the public key.
-        self.public_key = kp.public_key_hex();
+        // Step 1: set the public key as raw bytes.
+        self.public_key = kp.public_key.clone();
 
         // Step 2: compute the signing hash and sign it.
         let msg = hex::decode(self.signing_hash()).map_err(|e| e.to_string())?;
         let sig = sign::sign(&kp.secret_key, &msg)?;
 
-        // Step 3: set the signature.
-        self.signature = hex::encode(sig);
+        // Step 3: set the signature as raw bytes.
+        self.signature = sig;
 
         // Step 4: compute the txid AFTER public_key and signature are set.
         self.txid = self.compute_txid();
@@ -170,8 +173,7 @@ impl Transaction {
         if self.public_key.is_empty() {
             return None;
         }
-        let pk = hex::decode(&self.public_key).ok()?;
-        address::address_from_public_key(&pk).ok()
+        address::address_from_public_key(&self.public_key).ok()
     }
 
     pub fn is_valid(&self) -> bool {

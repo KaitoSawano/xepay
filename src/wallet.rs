@@ -5,7 +5,7 @@
 //! Wallet representation and persistence.
 
 use crate::datadir;
-use crate::secp256k1::{address, keypair::KeyPair};
+use crate::dilithium::{address, keypair::KeyPair};
 use crate::utils::now_millis;
 use serde::{Deserialize, Serialize};
 

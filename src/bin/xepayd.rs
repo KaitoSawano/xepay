@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
 use xepay::block::Block;
-use xepay::blockchain::Blockchain;
 use xepay::config::Config;
 use xepay::consensus::spec::{self, Network};
 use xepay::p2p::network::{spawn, NetworkCommand, NetworkConfig, PeerRegistry};
@@ -243,8 +242,6 @@ fn install_signal_handlers(rpc_shutdown: Arc<AtomicBool>, is_daemon_child: bool)
     let _ = rpc_shutdown;
 }
 
-// Spawns a new `xepayd --daemon-child` process in the background.
-// Waits until the child's RPC server is ready before exiting the parent.
 fn detach_to_background() {
     use std::process::Command;
     use std::thread::sleep;

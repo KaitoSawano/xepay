@@ -92,7 +92,6 @@ fn main() {
             rpc::call_and_print("dumpprivkey", vec![json!(args[2])]);
         }
         "dumpwallet" => rpc::call_and_print("dumpwallet", vec![]),
-        "migratewallet" => rpc::call_and_print("migratewallet", vec![]),
         "importprivkey" => {
             if args.len() < 3 {
                 println!("a private key argument is required");
@@ -244,49 +243,6 @@ fn main() {
             }
             println!("connect command is not yet implemented in CLI. Use P2P bootstrap instead.");
         }
-        "createhdwallet" => {
-            let word_count = if args.len() >= 3 {
-                match args[2].parse::<u64>() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        println!("invalid word count");
-                        return;
-                    }
-                }
-            } else {
-                12
-            };
-            rpc::call_and_print("createhdwallet", vec![json!(word_count)]);
-        }
-        "loadhdwallet" => rpc::call_and_print("loadhdwallet", vec![]),
-        "restorehdwallet" => {
-            if args.len() < 3 {
-                println!("usage: xepay restorehdwallet \"<mnemonic>\" [\"<passphrase>\"]");
-                return;
-            }
-            let mut params = vec![json!(args[2])];
-            if args.len() >= 4 {
-                params.push(json!(args[3]));
-            }
-            rpc::call_and_print("restorehdwallet", params);
-        }
-        "dumphdmnemonic" => rpc::call_and_print("dumphdmnemonic", vec![]),
-        "derivehdaddress" => {
-            if args.len() < 3 {
-                println!("usage: xepay derivehdaddress <index> [legacy|bech32]");
-                return;
-            }
-            let index: u64 = match args[2].parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    println!("invalid index");
-                    return;
-                }
-            };
-            let addr_type = if args.len() >= 4 { args[3].as_str() } else { "legacy" };
-            rpc::call_and_print("derivehdaddress", vec![json!(index), json!(addr_type)]);
-        }
-        "listhdaddresses" => rpc::call_and_print("listhdaddresses", vec![]),
         _ => {
             println!("unknown command: {}", args[1]);
             print_help();
@@ -344,17 +300,8 @@ fn print_help() {
     println!("  submitblock <block_json_file>       submit a block from a JSON file");
     println!("  dumpprivkey \"<address>\"             display the private key for the given address");
     println!("  dumpwallet                          dump all wallet addresses and private keys");
-    println!("  migratewallet                       migrate legacy wallet.dat to HD wallet (with backup)");
     println!("  importprivkey \"<privkey>\"           import a private key into the wallet");
     println!("  getbalance [address]                compute the wallet balance");
-    println!();
-    println!("HD wallet:");
-    println!("  createhdwallet [word_count]         create a new HD wallet (12 or 24 words, default 12)");
-    println!("  loadhdwallet                        load the HD wallet from disk");
-    println!("  restorehdwallet \"<mnemonic>\"        restore an HD wallet from a mnemonic phrase");
-    println!("  dumphdmnemonic                      display the HD wallet mnemonic");
-    println!("  derivehdaddress <index> [type]      derive an address at the given index (legacy or bech32)");
-    println!("  listhdaddresses                     list all derived HD addresses");
     println!();
     println!("daemon:");
     println!("  xepayd [-testnet|-regtest]       run the node (without mining)");

@@ -357,44 +357,57 @@ impl Block {
     }
 
     pub fn calculate_hash(&self) -> String {
-        let mut payload = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.nversion,
-            self.index,
-            self.timestamp,
-            self.mined_at,
-            self.mined_for,
-            self.previous_hash,
-            self.merkle_root,
-            self.state_root,
-            self.nonce,
-            self.nbits,
-            self.reward,
-            self.subsidy,
-            self.total_fees,
-            self.coinbase_txid,
-            self.blockchain_size,
-            self.genesis_output_script,
-            self.miner_pubkey,
-            self.miner_signature,
-            self.chainwork,
-            self.transactions.len()
-        );
+        let mut payload = Vec::new();
+
+        // Header fields
+        payload.extend_from_slice(&self.nversion.to_be_bytes());
+        payload.extend_from_slice(&self.index.to_be_bytes());
+        payload.extend_from_slice(&self.timestamp.to_be_bytes());
+        payload.extend_from_slice(self.mined_at.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.mined_for.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.previous_hash.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.merkle_root.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.state_root.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.nonce.to_be_bytes());
+        payload.extend_from_slice(&self.nbits.to_be_bytes());
+        payload.extend_from_slice(&self.reward.to_be_bytes());
+        payload.extend_from_slice(&self.subsidy.to_be_bytes());
+        payload.extend_from_slice(&self.total_fees.to_be_bytes());
+        payload.extend_from_slice(self.coinbase_txid.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.blockchain_size.to_be_bytes());
+        payload.extend_from_slice(self.genesis_output_script.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.miner_pubkey.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(self.miner_signature.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.chainwork.to_be_bytes());
+
+        // Transactions
+        payload.extend_from_slice(&(self.transactions.len() as u64).to_be_bytes());
         for tx in &self.transactions {
-            payload.push_str(&format!(
-                "\n{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                tx.from,
-                tx.to,
-                tx.amount,
-                tx.fee,
-                tx.nonce,
-                tx.note,
-                tx.output_script,
-                tx.public_key,
-                tx.signature
-            ));
+            payload.extend_from_slice(tx.from.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(tx.to.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&tx.amount.to_be_bytes());
+            payload.extend_from_slice(&tx.fee.to_be_bytes());
+            payload.extend_from_slice(&tx.nonce.to_be_bytes());
+            payload.extend_from_slice(tx.note.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(tx.output_script.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&tx.public_key);
+            payload.extend_from_slice(&tx.signature);
         }
-        sha3_256_hex(payload.as_bytes())
+
+        sha3_256_hex(&payload)
     }
 
     pub fn reward_at(height: u64) -> u64 {

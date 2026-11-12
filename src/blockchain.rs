@@ -461,6 +461,28 @@ impl Blockchain {
         tx.fee / size
     }
 
+    /// Calculate the current minimum fee per byte based on mempool pressure.
+    /// The base fee is MIN_RELAY_FEE_PER_BYTE (1 ALD).
+    /// As the mempool fills up, the minimum fee increases exponentially.
+    pub fn current_min_fee_per_byte(&self) -> u64 {
+        let size = self.mempool_size_bytes();
+        let max = MAX_MEMPOOL_SIZE_BYTES;
+        
+        if size < max / 2 {
+            // Mempool is less than 50% full. Use the base minimum.
+            MIN_RELAY_FEE_PER_BYTE
+        } else if size < (max * 3) / 4 {
+            // Mempool is 50%-75% full. Double the minimum fee.
+            MIN_RELAY_FEE_PER_BYTE * 2
+        } else if size < (max * 9) / 10 {
+            // Mempool is 75%-90% full. Five times the minimum fee.
+            MIN_RELAY_FEE_PER_BYTE * 5
+        } else {
+            // Mempool is >90% full. Ten times the minimum fee.
+            MIN_RELAY_FEE_PER_BYTE * 10
+        }
+    }
+
     pub fn evict_lowest_fee_transactions(&mut self, needed_space: usize) {
         self.mempool.sort_by(|a, b| {
             let fee_a = Self::fee_rate(a).saturating_mul(Self::tx_size_bytes(a) as u64);
@@ -555,9 +577,14 @@ impl Blockchain {
 
         let tx_size = Self::tx_size_bytes(&tx);
         let fee_rate = Self::fee_rate(&tx);
-
-        if fee_rate < MIN_RELAY_FEE_PER_BYTE {
-            println!("[mempool] Rejected tx {}: fee rate {} < minRelayTxFee {}", tx.txid, fee_rate, MIN_RELAY_FEE_PER_BYTE);
+        
+        // === DYNAMIC FEE MARKET ===
+        let current_min_fee = self.current_min_fee_per_byte();
+        if fee_rate < current_min_fee {
+            println!(
+                "[mempool] Rejected tx {}: fee rate {} < dynamic minRelayTxFee {} (mempool size: {} bytes)", 
+                tx.txid, fee_rate, current_min_fee, self.mempool_size_bytes()
+            );
             return false;
         }
 
