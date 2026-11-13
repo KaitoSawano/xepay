@@ -199,7 +199,12 @@ impl StateDB {
                 ));
             }
 
-            from_acc.balance -= total;
+            // FIX: Use checked_sub to prevent underflow
+            from_acc.balance = from_acc
+                .balance
+                .checked_sub(total)
+                .ok_or_else(|| "underflow during simulation".to_string())?;
+
             from_acc.nonce = from_acc
                 .nonce
                 .checked_add(1)
@@ -367,7 +372,12 @@ impl StateDB {
             storage: BTreeMap::new(),
         });
 
-        from_acc.balance -= total;
+        // FIX: Use checked_sub to prevent underflow (coin creation)
+        from_acc.balance = from_acc
+            .balance
+            .checked_sub(total)
+            .ok_or_else(|| "underflow during deduction".to_string())?;
+
         from_acc.nonce = from_acc
             .nonce
             .checked_add(1)
