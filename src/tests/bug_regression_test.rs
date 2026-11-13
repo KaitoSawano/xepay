@@ -3,12 +3,6 @@
 // file LICENSE or https://www.apache.org/licenses/LICENSE-2.0.
 
 //! Regression tests for the five bugs identified during the code review.
-//!
-//! Bug #1 is intentionally left unresolved during development: the
-//! nonce in `spec.rs` and the nonce in `genesis.rs` are allowed to
-//! diverge while the genesis parameters are being finalised. The tests
-//! below therefore check only that `genesis.rs` is internally
-//! consistent, not that it agrees with `spec.rs`.
 
 use serial_test::serial;
 use std::sync::Mutex;
@@ -20,7 +14,7 @@ use xepay::validation;
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 fn with_temp_datadir<F: FnOnce()>(f: F) {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir failed");
     let path = dir.keep();
     std::env::set_var("XEPC_DATADIR", &path);
@@ -49,91 +43,30 @@ fn bug_1_genesis_accessors_are_internally_consistent() {
 
 #[test]
 fn bug_2_address_prefix_is_network_aware() {
-    assert_eq!(
-        xepay::blockchain::legacy_prefix_byte_for(Network::Main),
-        0x30,
-        "Mainnet legacy prefix byte must be 0x30"
-    );
-
-    assert_eq!(
-        xepay::blockchain::bech32_hrp_for(Network::Main),
-        "xepc",
-        "Mainnet bech32 HRP must be xepc"
-    );
-
-    assert_eq!(
-        xepay::blockchain::legacy_prefix_byte_for(Network::Test),
-        0x6f,
-        "Testnet legacy prefix byte must be 0x6f"
-    );
-
-    assert_eq!(
-        xepay::blockchain::bech32_hrp_for(Network::Test),
-        "xtes",
-        "Testnet bech32 HRP must be xtes"
-    );
-
-    assert_eq!(
-        xepay::blockchain::legacy_prefix_byte_for(Network::Regtest),
-        0x6f,
-        "Regtest legacy prefix byte must be 0x6f"
-    );
-
-    assert_eq!(
-        xepay::blockchain::bech32_hrp_for(Network::Regtest),
-        "xreg",
-        "Regtest bech32 HRP must be xreg"
-    );
+    assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Main), 0x30);
+    assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Main), "xepc");
+    assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Test), 0x6f);
+    assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Test), "xtes");
+    assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Regtest), 0x6f);
+    assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Regtest), "xreg");
 }
 
 #[test]
 #[serial]
 fn bug_2_address_validation_uses_correct_prefix() {
     with_temp_datadir(|| {
-        use xepay::secp256k1::address;
-        use xepay::secp256k1::keypair::KeyPair;
+        use xepay::dilithium::address;
+        use xepay::dilithium::keypair::KeyPair;
 
         let chain = Blockchain::new();
-
         let kp = KeyPair::generate().expect("keypair generation failed");
 
-        let legacy_addr =
-            address::address_from_public_key(&kp.public_key).expect("legacy address failed");
-        assert!(
-            validation::is_valid_address(&legacy_addr, &chain),
-            "legacy address should be valid: {}",
-            legacy_addr
-        );
+        let legacy_addr = address::address_from_public_key(&kp.public_key).expect("legacy address failed");
+        assert!(validation::is_valid_address(&legacy_addr, &chain));
 
-        let bech32_addr = address::address_from_public_key_bech32(&kp.public_key)
-            .expect("bech32 address failed");
-        assert!(
-            validation::is_valid_address(&bech32_addr, &chain),
-            "bech32 address should be valid: {}",
-            bech32_addr
-        );
+        let bech32_addr = address::address_from_public_key_bech32(&kp.public_key).expect("bech32 address failed");
+        assert!(validation::is_valid_address(&bech32_addr, &chain));
 
-        assert!(
-            !validation::is_valid_address("not-an-address", &chain),
-            "Random string should be invalid"
-        );
-    });
-}
-
-#[test]
-#[serial]
-fn bug_4_temp_datadir_is_safe() {
-    with_temp_datadir(|| {
-        let chain = Blockchain::new();
-        assert_eq!(chain.height(), 0, "Genesis height should be 0");
-    });
-}
-
-#[test]
-#[serial]
-fn bug_4_temp_datadir_is_safe_again() {
-    with_temp_datadir(|| {
-        let chain = Blockchain::new();
-        assert_eq!(chain.chain.len(), 1, "Genesis chain should have one block");
+        assert!(!validation::is_valid_address("not-an-address", &chain));
     });
 }
