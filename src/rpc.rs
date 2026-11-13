@@ -1527,9 +1527,11 @@ impl RpcHandler {
             nonce
         );
 
-        if let Err(e) = storage::save_chain(&mut chain) {
-            return RpcResponse::err(&format!("failed to save chain: {}", e));
-        }
+        // NOTE: Removed `storage::save_chain(&mut chain)` here.
+        // The mempool is kept in RAM. It will be flushed to disk
+        // automatically when a block is mined or when the node stops.
+        // This prevents the LevelDB `.log` file from bloating unnecessarily.
+
         let mempool_len = chain.mempool.len();
         drop(chain);
 
