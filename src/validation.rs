@@ -83,6 +83,41 @@ pub fn rule_self_send(tx: &Transaction) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Bitcoin-Grade: Ensure the amount is within the valid money range.
+/// This prevents integer overflow attacks where a user tries to send
+/// an amount larger than the total supply.
+pub fn rule_money_range(tx: &Transaction) -> Result<(), ValidationError> {
+    let max_money = spec::MAX_SUPPLY;
+    
+    if tx.amount > max_money {
+        return Err(ValidationError::new(
+            "E005",
+            format!("amount {} exceeds MAX_MONEY {}", tx.amount, max_money),
+        ));
+    }
+    
+    if tx.fee > max_money {
+        return Err(ValidationError::new(
+            "E005",
+            format!("fee {} exceeds MAX_MONEY {}", tx.fee, max_money),
+        ));
+    }
+
+    // Check if amount + fee overflows or exceeds MAX_MONEY
+    let total = tx.amount.checked_add(tx.fee).ok_or_else(|| {
+        ValidationError::new("E005", "amount + fee overflows u64")
+    })?;
+
+    if total > max_money {
+        return Err(ValidationError::new(
+            "E005",
+            format!("total amount + fee {} exceeds MAX_MONEY {}", total, max_money),
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn rule_amount_nonzero(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.amount == 0 {
         return Err(ValidationError::new(
@@ -114,7 +149,6 @@ pub fn rule_signature(tx: &Transaction) -> Result<(), ValidationError> {
         return Err(ValidationError::new("E010", "signature is empty"));
     }
     
-    // public_key dan signature sekarang berupa byte mentah (Vec<u8>).
     let pk = &tx.public_key;
     let sig = &tx.signature;
     
@@ -535,6 +569,7 @@ pub fn validate_transaction(chain: &Blockchain, tx: &Transaction) -> Result<(), 
     rule_address_format(&tx.to, chain)?;
     rule_self_send(tx)?;
     rule_amount_nonzero(tx)?;
+    rule_money_range(tx)?; // NEW: Add Bitcoin-Grade MAX_MONEY check
     rule_note_length(tx)?;
     rule_signature(tx)?;
     rule_address_matches_pubkey(tx)?;
@@ -557,12 +592,8 @@ pub fn validate_block_transactions(
             continue;
         }
 
-        // Reject self-transfers at the block level. Without this check, a
-        // block could contain a transaction whose sender and recipient are
-        // the same address, which the state layer would process by
-        // overwriting the debited balance with the credited balance and
-        // thereby create coins out of thin air.
         rule_self_send(tx)?;
+        rule_money_range(tx)?; // NEW: Also check here for block validation
 
         let base_nonce = overlay_nonces
             .get(&tx.from)
@@ -610,9 +641,6 @@ pub fn validate_block_transactions(
     Ok(())
 }
 
-/// Reject any block whose `state_root` is empty or malformed. An empty
-/// state root can never be produced by an honest node because every
-/// block commits to the state after applying its transactions.
 pub fn rule_block_state_root_nonempty(block: &Block) -> Result<(), ValidationError> {
     if block.index == 0 {
         return Ok(());
@@ -662,9 +690,6 @@ pub fn validate_block(
     rule_block_reward(block)?;
     rule_block_coinbase_consistent(block)?;
     rule_mined_for_valid(block, chain)?;
-    // Validate the state root before the proof of work so that a block
-    // with a structural defect is rejected without spending time on the
-    // hash check.
     rule_block_state_root_nonempty(block)?;
     rule_block_pow(block)?;
     rule_block_tx_count(block)?;
@@ -673,6 +698,17 @@ pub fn validate_block(
     rule_block_nbits(chain, block)?;
     rule_block_chainwork(prev, block)?;
     validate_block_transactions(chain, &block.transactions, block.index)?;
+    
+    // NEW: Verify total supply does not exceed MAX_MONEY after this block
+    let new_supply = chain.circulating_supply().checked_add(block.reward)
+        .ok_or_else(|| ValidationError::new("E041", "supply overflow"))?;
+    if new_supply > spec::MAX_SUPPLY {
+        return Err(ValidationError::new(
+            "E041",
+            format!("new supply {} exceeds MAX_MONEY {}", new_supply, spec::MAX_SUPPLY)
+        ));
+    }
+
     Ok(())
 }
 
