@@ -17,7 +17,7 @@ use crate::consensus::spec::{self, Network}; // Network selector and parameters.
 // The message embedded in the genesis coinbase transaction.
 pub const GENESIS_MESSAGE: &str = "XEPAY Genesis - 2026";
 // The secret embedded in the genesis secret transaction.
-pub const GENESIS_SECRET: &str = "ID Today 15/Oct/2026";
+pub const GENESIS_SECRET: &str = "ID Today 12/Nov/2026 Aldianokto, Chaos in the Treasury, Order in the Code";
 
 // ----------------------------------------------------------------------
 // Genesis output script (P2PK, same format as the reference implementation)
