@@ -1464,13 +1464,17 @@ impl RpcHandler {
             let chain = self.state.chain.blocking_read();
             let height = chain.height();
             let bal = chain.mature_balance_at(&from_address, height);
-            if bal <= fee {
-                return RpcResponse::err(&format!(
-                    "mature balance {} ald is too small to cover the fee of {} ald",
-                    bal, fee
-                ));
+            
+            // FIX: Use checked_sub to prevent underflow if bal <= fee
+            match bal.checked_sub(fee) {
+                Some(v) if v > 0 => v,
+                _ => {
+                    return RpcResponse::err(&format!(
+                        "mature balance {} ald is too small to cover the fee of {} ald",
+                        bal, fee
+                    ));
+                }
             }
-            bal - fee
         } else {
             amount_ald
         };
