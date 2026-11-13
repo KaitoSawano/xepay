@@ -7,13 +7,11 @@
 mod bug_regression_test;
 mod coin_creation_test;
 mod difficulty_test;
-mod dynamic_fee_test;
 mod genesis_test;
 mod halving_test;
 mod hash_test;
-mod hdwallet_test;
+mod dilithium_test;
 mod pow_test;
-mod secp256k1_test;
 mod security_hardening_test;
 mod sendtoaddress_test;
 mod storage_test;
