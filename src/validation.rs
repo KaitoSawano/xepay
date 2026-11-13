@@ -103,7 +103,6 @@ pub fn rule_money_range(tx: &Transaction) -> Result<(), ValidationError> {
         ));
     }
 
-    // Check if amount + fee overflows or exceeds MAX_MONEY
     let total = tx.amount.checked_add(tx.fee).ok_or_else(|| {
         ValidationError::new("E005", "amount + fee overflows u64")
     })?;
@@ -288,7 +287,10 @@ pub fn rule_block_subsidy(block: &Block) -> Result<(), ValidationError> {
 }
 
 pub fn rule_block_reward(block: &Block) -> Result<(), ValidationError> {
-    let expected = block.subsidy.saturating_add(block.total_fees);
+    // FIX: Use checked_add to prevent overflow if a miner tries to claim u64::MAX
+    let expected = block.subsidy.checked_add(block.total_fees)
+        .ok_or_else(|| ValidationError::new("E046", "block reward overflow"))?;
+        
     if block.reward != expected {
         return Err(ValidationError::new(
             "E046",
@@ -569,7 +571,7 @@ pub fn validate_transaction(chain: &Blockchain, tx: &Transaction) -> Result<(), 
     rule_address_format(&tx.to, chain)?;
     rule_self_send(tx)?;
     rule_amount_nonzero(tx)?;
-    rule_money_range(tx)?; // NEW: Add Bitcoin-Grade MAX_MONEY check
+    rule_money_range(tx)?;
     rule_note_length(tx)?;
     rule_signature(tx)?;
     rule_address_matches_pubkey(tx)?;
@@ -593,7 +595,7 @@ pub fn validate_block_transactions(
         }
 
         rule_self_send(tx)?;
-        rule_money_range(tx)?; // NEW: Also check here for block validation
+        rule_money_range(tx)?;
 
         let base_nonce = overlay_nonces
             .get(&tx.from)
@@ -699,7 +701,7 @@ pub fn validate_block(
     rule_block_chainwork(prev, block)?;
     validate_block_transactions(chain, &block.transactions, block.index)?;
     
-    // NEW: Verify total supply does not exceed MAX_MONEY after this block
+    // Verify total supply does not exceed MAX_MONEY after this block
     let new_supply = chain.circulating_supply().checked_add(block.reward)
         .ok_or_else(|| ValidationError::new("E041", "supply overflow"))?;
     if new_supply > spec::MAX_SUPPLY {
