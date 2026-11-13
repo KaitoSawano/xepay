@@ -34,7 +34,7 @@ pub const GENESIS_OUTPUT_SCRIPT: &str = "ML-DSA-65 OP_CHECKSIG";
 // ----------------------------------------------------------------------
 
 // The mainnet genesis timestamp (in milliseconds).
-pub const GENESIS_TIMESTAMP: u128 = 1792303198445;
+pub const GENESIS_TIMESTAMP: u128 = 1794497705601;
 
 // The expected mainnet genesis hash.
 //
@@ -42,17 +42,17 @@ pub const GENESIS_TIMESTAMP: u128 = 1792303198445;
 // GENESIS_OUTPUT_SCRIPT or the signature algorithm. Run `xepay-genesis`
 // and paste the output here.
 pub const EXPECTED_GENESIS_HASH: &str =
-    "PLACEHOLDER_RUN_XEPAY_GENESIS_MAINNET";
+    "00000ea8a2c578692cd5a06e9231f438b703ddbb351487361e5b8579c6d27602";
 
 // The expected mainnet genesis merkle root.
 pub const EXPECTED_GENESIS_MERKLE_ROOT: &str =
-    "PLACEHOLDER_RUN_XEPAY_GENESIS_MAINNET";
+    "5b5f87574865b0d5978f82cc026ffe79f3712b7ff0fa9a8810a38f1ed508fe56";
 
 // The expected mainnet genesis timestamp.
-pub const EXPECTED_GENESIS_TIMESTAMP: u128 = 1792303198445;
+pub const EXPECTED_GENESIS_TIMESTAMP: u128 = 1794497705601;
 
 // The expected mainnet genesis nonce.
-pub const EXPECTED_GENESIS_NONCE: u64 = 0;
+pub const EXPECTED_GENESIS_NONCE: u64 = 227407;
 
 // ----------------------------------------------------------------------
 // Testnet genesis
