@@ -343,11 +343,15 @@ impl Blockchain {
         self.chain.iter().fold(0u64, |acc, b| acc.saturating_add(b.reward))
     }
 
+    // FIX: Prevent overflow by capping halvings_u64 before casting to u32
     pub fn calculate_reward(height: u64) -> u64 {
-        let halvings = (height / spec::SUBSIDY_HALVING_INTERVAL) as u32;
-        if halvings >= spec::MAX_HALVINGS {
+        let halvings_u64 = height / spec::SUBSIDY_HALVING_INTERVAL;
+        
+        if halvings_u64 >= spec::MAX_HALVINGS as u64 {
             return 0;
         }
+        
+        let halvings = halvings_u64 as u32;
         spec::INITIAL_REWARD >> halvings
     }
 
