@@ -601,7 +601,7 @@ impl RpcHandler {
             }
         };
 
-        let mut c = self.state.chain.blocking_write();
+        let c = self.state.chain.blocking_write();
 
         if !validation::is_valid_address(&mining_address, &c) {
             return RpcResponse::err("invalid mining address format");
