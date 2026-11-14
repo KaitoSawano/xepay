@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::block::Block;
 use crate::blockchain::Blockchain;
+use crate::transaction::Transaction;
 use crate::validation;
 
 pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
@@ -126,9 +127,12 @@ impl SyncState {
             return Err(format!("state rollback failed: {}", e));
         }
 
-        // FIX: Rebuild the addresses list from the remaining chain to prevent
-        // state divergence caused by stale addresses from the reorged blocks.
+        // FIX BUG AW: Rebuild the mempool and addresses from the remaining chain
+        // to prevent stale transactions from causing double spends.
         let mut addresses = vec!["GENESIS".to_string()];
+        let mut new_mempool = Vec::new();
+        let mut mempool_timestamps = std::collections::HashMap::new();
+        
         for block in &chain.chain {
             if !block.mined_for.is_empty() && !addresses.contains(&block.mined_for) {
                 addresses.push(block.mined_for.clone());
@@ -144,12 +148,32 @@ impl SyncState {
                 }
             }
         }
+
+        // Re-add transactions from rolled-back blocks back to mempool
+        // if they are still valid against the new chain state.
+        for block in &rollback_blocks {
+            for tx in &block.transactions {
+                if validation::is_special_tx(tx) {
+                    continue;
+                }
+                // Re-validate against the current (rolled back) chain.
+                if validation::validate_transaction(chain, tx).is_ok() {
+                    new_mempool.push(tx.clone());
+                    let now = (crate::utils::now_millis() / 1000) as u64;
+                    mempool_timestamps.insert(tx.txid.clone(), now);
+                }
+            }
+        }
+
         chain.addresses = addresses;
+        chain.mempool = new_mempool;
+        chain.mempool_timestamps = mempool_timestamps;
 
         println!(
-            "[reorg] rolled back {} blocks to height {}",
+            "[reorg] rolled back {} blocks to height {}, rebuilt mempool with {} transactions",
             rollback_blocks.len(),
-            ancestor_index
+            ancestor_index,
+            chain.mempool.len()
         );
 
         if let Err(e) = Self::accept_block(chain, new_block) {
