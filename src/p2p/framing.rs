@@ -60,8 +60,18 @@ pub fn read_message<R: Read>(reader: &mut R) -> io::Result<(String, Vec<u8>)> {
 
     let expected_checksum = [header[20], header[21], header[22], header[23]];
 
-    let mut payload = vec![0u8; length];
-    reader.read_exact(&mut payload)?;
+    // FIX BUG AK: Pre-allocate only a reasonable capacity and read in chunks
+    // to prevent the attacker from forcing an immediate huge memory allocation.
+    let mut payload = Vec::with_capacity(std::cmp::min(length, 65_536));
+    let mut chunk = vec![0u8; 4096];
+    let mut remaining = length;
+
+    while remaining > 0 {
+        let to_read = std::cmp::min(remaining, chunk.len());
+        reader.read_exact(&mut chunk[..to_read])?;
+        payload.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
 
     let actual_checksum = checksum(&payload);
     if actual_checksum != expected_checksum {
