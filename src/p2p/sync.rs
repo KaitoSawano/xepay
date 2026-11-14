@@ -126,6 +126,26 @@ impl SyncState {
             return Err(format!("state rollback failed: {}", e));
         }
 
+        // FIX: Rebuild the addresses list from the remaining chain to prevent
+        // state divergence caused by stale addresses from the reorged blocks.
+        let mut addresses = vec!["GENESIS".to_string()];
+        for block in &chain.chain {
+            if !block.mined_for.is_empty() && !addresses.contains(&block.mined_for) {
+                addresses.push(block.mined_for.clone());
+            }
+            for tx in &block.transactions {
+                if !validation::is_special_tx(tx) {
+                    if !addresses.contains(&tx.from) {
+                        addresses.push(tx.from.clone());
+                    }
+                    if !addresses.contains(&tx.to) {
+                        addresses.push(tx.to.clone());
+                    }
+                }
+            }
+        }
+        chain.addresses = addresses;
+
         println!(
             "[reorg] rolled back {} blocks to height {}",
             rollback_blocks.len(),
