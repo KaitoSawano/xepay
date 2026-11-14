@@ -32,7 +32,9 @@ use crate::utils::{format_datetime, now_millis};
 use crate::validation;
 
 const ASMAP_JSON: &str = include_str!("asmap.json");
-const MAX_WRITE_BUFFER: usize = 10 * 1024 * 1024;
+
+// FIX BUG BA: Reduce the write buffer limit to prevent OOM with many inbound peers.
+const MAX_WRITE_BUFFER: usize = 2 * 1024 * 1024;
 
 // Rate limiting constants for incoming P2P messages.
 const MAX_TX_PER_SECOND: u32 = 50;
@@ -998,11 +1000,29 @@ impl Network {
         let tip_index = chain.chain.last().map(|b| b.index).unwrap_or(0);
         let mut to_request = Vec::new();
         for h in &headers {
-            if validation::rule_block_pow(h).is_err() {
+            // FIX BUG AY: Validate all header fields, not just PoW.
+            if let Err(e) = validation::rule_block_pow(h) {
                 drop(chain);
-                self.punish(id, 50, "invalid header proof of work").await;
+                self.punish(id, 50, &format!("invalid header PoW: {}", e)).await;
                 return;
             }
+            if let Err(e) = validation::rule_block_hash_consistent(h) {
+                drop(chain);
+                self.punish(id, 50, &format!("invalid header hash: {}", e)).await;
+                return;
+            }
+            if let Err(e) = validation::rule_block_nbits(&chain, h) {
+                drop(chain);
+                self.punish(id, 50, &format!("invalid header nbits: {}", e)).await;
+                return;
+            }
+            // Timestamp validation for headers to prevent sync stall.
+            if h.timestamp > crate::utils::now_millis().saturating_add(2 * 60 * 60 * 1000) {
+                drop(chain);
+                self.punish(id, 50, "header timestamp too far in the future").await;
+                return;
+            }
+
             if h.index > tip_index && !self.inv.has_block(&h.hash) {
                 // Respect the moving download window.
                 if self.sync_state.request_block(&h.hash) {
