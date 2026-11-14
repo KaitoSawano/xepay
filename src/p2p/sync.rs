@@ -164,6 +164,44 @@ impl SyncState {
             return Err(format!("block {} rejected: {}", block.index, e));
         }
 
+        // Pre-validation of state root simulation to prevent state corruption.
+        let mut addresses = chain.addresses.clone();
+        if !addresses.contains(&block.mined_for) {
+            addresses.push(block.mined_for.clone());
+        }
+        for tx in &block.transactions {
+            if !addresses.contains(&tx.from) {
+                addresses.push(tx.from.clone());
+            }
+            if !addresses.contains(&tx.to) {
+                addresses.push(tx.to.clone());
+            }
+        }
+
+        let simulated_root = match chain.state.simulate_apply(
+            &addresses,
+            &block.transactions,
+            &block.mined_for,
+            block.reward,
+            block.index,
+        ) {
+            Ok(root) => root,
+            Err(e) => {
+                return Err(format!(
+                    "failed to simulate block for state root validation: {}",
+                    e
+                ));
+            }
+        };
+
+        let simulated_root_hex = hex::encode(simulated_root);
+        if simulated_root_hex != block.state_root {
+            return Err(format!(
+                "block rejected: state root mismatch (declared {}, simulated {})",
+                block.state_root, simulated_root_hex
+            ));
+        }
+
         for tx in &block.transactions {
             if let Err(e) = chain.apply_transaction(tx) {
                 return Err(format!(
