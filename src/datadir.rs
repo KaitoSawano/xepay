@@ -5,6 +5,7 @@
 //! Data directory layout and path helpers.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::consensus::spec;
 
@@ -19,6 +20,8 @@ pub const BLOCK_FILE_PREFIX: &str = "blk";
 pub const PEER_ID_FILE: &str = "peer_id";
 pub const COOKIE_FILE: &str = ".cookie";
 pub const STATE_DB_DIR: &str = "state_db";
+
+static LOG_MUTEX: Mutex<()> = Mutex::new(());
 
 pub fn datadir() -> PathBuf {
     if let Ok(custom) = std::env::var("XEPC_DATADIR") {
@@ -84,6 +87,7 @@ pub fn as_str(p: &Path) -> String {
 }
 
 pub fn append_debug_log(line: &str) {
+    let _guard = LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let _ = ensure_dirs();
     let path = debug_log_path();
     let ts = crate::utils::now_millis();
