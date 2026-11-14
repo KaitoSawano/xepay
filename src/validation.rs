@@ -75,11 +75,59 @@ pub fn rule_address_format(addr: &str, chain: &Blockchain) -> Result<(), Validat
 
 pub fn rule_self_send(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.from == tx.to {
+        // Allow self-send only if it is a message transaction with a
+        // minimal amount.
+        if tx.is_message_tx() && tx.amount == rules::MIN_MESSAGE_AMOUNT {
+            return Ok(());
+        }
         return Err(ValidationError::new(
             "E004",
             "sender and recipient addresses are identical",
         ));
     }
+    Ok(())
+}
+
+pub fn rule_message_format(tx: &Transaction) -> Result<(), ValidationError> {
+    if !tx.is_message_tx() {
+        return Ok(());
+    }
+
+    // Message tx must be self-send.
+    if tx.from != tx.to {
+        return Err(ValidationError::new(
+            "E054",
+            "message transaction must be a self-send",
+        ));
+    }
+
+    // Amount must be exactly MIN_MESSAGE_AMOUNT.
+    if tx.amount != rules::MIN_MESSAGE_AMOUNT {
+        return Err(ValidationError::new(
+            "E054",
+            format!(
+                "message transaction amount must be exactly {} ALD",
+                rules::MIN_MESSAGE_AMOUNT
+            ),
+        ));
+    }
+
+    // Payload must be valid hex and valid UTF-8.
+    if tx.extract_message().is_none() {
+        return Err(ValidationError::new(
+            "E054",
+            "message transaction payload is not valid hex-encoded UTF-8",
+        ));
+    }
+
+    let msg = tx.extract_message().unwrap();
+    if msg.len() > rules::MAX_MESSAGE_LEN {
+        return Err(ValidationError::new(
+            "E054",
+            format!("message exceeds {} bytes", rules::MAX_MESSAGE_LEN),
+        ));
+    }
+
     Ok(())
 }
 
@@ -216,7 +264,6 @@ pub fn rule_nonce(chain: &Blockchain, tx: &Transaction) -> Result<(), Validation
         if !has_mempool_tx {
             break;
         }
-        // FIX BUG AC: Use checked_add to prevent nonce overflow.
         match expected.checked_add(1) {
             Some(v) => expected = v,
             None => {
@@ -579,6 +626,7 @@ pub fn validate_transaction(chain: &Blockchain, tx: &Transaction) -> Result<(), 
     rule_address_format(&tx.from, chain)?;
     rule_address_format(&tx.to, chain)?;
     rule_self_send(tx)?;
+    rule_message_format(tx)?;
     rule_amount_nonzero(tx)?;
     rule_money_range(tx)?;
     rule_note_length(tx)?;
@@ -617,8 +665,6 @@ pub fn validate_block_transactions(
             ));
         }
 
-        // FIX: Use the block height passed as an argument instead of chain.height()
-        // to ensure consensus consistency during historical validation or reorgs.
         let base_balance = overlay_balances
             .get(&tx.from)
             .copied()
@@ -635,22 +681,28 @@ pub fn validate_block_transactions(
             ));
         }
 
-        // FIX: Use checked_sub to mathematically guarantee no underflow.
         let new_from = base_balance.checked_sub(need)
             .ok_or_else(|| ValidationError::new("E023", "underflow during overlay balance calculation"))?;
         overlay_balances.insert(tx.from.clone(), new_from);
 
-        let to_balance = overlay_balances
-            .get(&tx.to)
-            .copied()
-            .unwrap_or_else(|| chain.balance_of(&tx.to));
-        let new_to = match to_balance.checked_add(tx.amount) {
-            Some(v) => v,
-            None => return Err(ValidationError::new("E024", "recipient balance overflows u64")),
-        };
-        overlay_balances.insert(tx.to.clone(), new_to);
+        // For self-send, the amount is returned to the sender.
+        if tx.from != tx.to {
+            let to_balance = overlay_balances
+                .get(&tx.to)
+                .copied()
+                .unwrap_or_else(|| chain.balance_of(&tx.to));
+            let new_to = match to_balance.checked_add(tx.amount) {
+                Some(v) => v,
+                None => return Err(ValidationError::new("E024", "recipient balance overflows u64")),
+            };
+            overlay_balances.insert(tx.to.clone(), new_to);
+        } else {
+            // Refund the self-send amount back to sender (fee is burned).
+            let refunded = new_from.checked_add(tx.amount)
+                .ok_or_else(|| ValidationError::new("E024", "self-send refund overflow"))?;
+            overlay_balances.insert(tx.from.clone(), refunded);
+        }
 
-        // FIX BUG AB: Prevent nonce overflow in overlay.
         let next_nonce = base_nonce.checked_add(1)
             .ok_or_else(|| ValidationError::new("E023", "nonce overflow in overlay"))?;
         overlay_nonces.insert(tx.from.clone(), next_nonce);
