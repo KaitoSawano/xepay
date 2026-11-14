@@ -193,11 +193,17 @@ impl Wallet {
         for entry in decrypted.entries.iter_mut() {
             // Use the per-entry nonce. Fallback to the legacy global nonce
             // for wallets created before this fix.
-            let nonce = if entry.encryption_nonce.is_empty() {
-                crate::utils::hex_to_bytes(&self.nonce)?
+            let nonce_hex = if entry.encryption_nonce.is_empty() {
+                &self.nonce
             } else {
-                crate::utils::hex_to_bytes(&entry.encryption_nonce)?
+                &entry.encryption_nonce
             };
+
+            let nonce = crate::utils::hex_to_bytes(nonce_hex)?;
+            // FIX BUG AP: Validate nonce length to prevent AES-GCM panic.
+            if nonce.len() != 12 {
+                return Err(format!("invalid nonce length for address {}", entry.address));
+            }
 
             let plaintext = xepay_crypto::aes_decrypt(&key, &nonce, &entry.secret)?;
             entry.secret = plaintext;
