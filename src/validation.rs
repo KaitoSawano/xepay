@@ -216,7 +216,16 @@ pub fn rule_nonce(chain: &Blockchain, tx: &Transaction) -> Result<(), Validation
         if !has_mempool_tx {
             break;
         }
-        expected += 1;
+        // FIX BUG AC: Use checked_add to prevent nonce overflow.
+        match expected.checked_add(1) {
+            Some(v) => expected = v,
+            None => {
+                return Err(ValidationError::new(
+                    "E023",
+                    "nonce sequence has reached the maximum value",
+                ));
+            }
+        }
     }
     if tx.nonce != expected {
         return Err(ValidationError::new(
@@ -641,7 +650,10 @@ pub fn validate_block_transactions(
         };
         overlay_balances.insert(tx.to.clone(), new_to);
 
-        overlay_nonces.insert(tx.from.clone(), base_nonce + 1);
+        // FIX BUG AB: Prevent nonce overflow in overlay.
+        let next_nonce = base_nonce.checked_add(1)
+            .ok_or_else(|| ValidationError::new("E023", "nonce overflow in overlay"))?;
+        overlay_nonces.insert(tx.from.clone(), next_nonce);
     }
 
     Ok(())
