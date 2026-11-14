@@ -1425,7 +1425,7 @@ impl RpcHandler {
             custom
         } else {
             // Ask the chain for the current dynamic minimum fee
-            let chain = self.state.chain.blocking_read();
+            let mut chain = self.state.chain.blocking_write();
             let dynamic_min_fee_rate = chain.current_min_fee_per_byte();
             drop(chain);
             
