@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use super::account::Account;
 use super::adapter::LevelDbAdapter;
+use crate::consensus::rules;
 
 pub struct StateDB {
     trie: EthTrie<LevelDbAdapter>,
@@ -166,9 +167,18 @@ impl StateDB {
                 continue;
             }
 
+            let is_message = tx.is_message_tx();
+            
             if tx.from == tx.to {
+                if !is_message || tx.amount != rules::MIN_MESSAGE_AMOUNT {
+                    return Err(format!(
+                        "self-transfer rejected during simulation: {}",
+                        tx.txid
+                    ));
+                }
+            } else if is_message {
                 return Err(format!(
-                    "self-transfer rejected during simulation: {}",
+                    "message transaction must be a self-send: {}",
                     tx.txid
                 ));
             }
@@ -185,8 +195,11 @@ impl StateDB {
 
             let mut from_acc = read_account_from_trie(&mut temp_trie, &from_key)?
                 .unwrap_or_else(empty_account);
-            let mut to_acc = read_account_from_trie(&mut temp_trie, &to_key)?
-                .unwrap_or_else(empty_account);
+            let mut to_acc = if tx.from != tx.to {
+                read_account_from_trie(&mut temp_trie, &to_key)?.unwrap_or_else(empty_account)
+            } else {
+                empty_account()
+            };
 
             if from_acc.nonce != tx.nonce {
                 return Err(format!(
@@ -206,7 +219,6 @@ impl StateDB {
                 ));
             }
 
-            // FIX: Use checked_sub to prevent underflow
             from_acc.balance = from_acc
                 .balance
                 .checked_sub(total)
@@ -216,19 +228,28 @@ impl StateDB {
                 .nonce
                 .checked_add(1)
                 .ok_or_else(|| "sender nonce overflow".to_string())?;
-            to_acc.balance = to_acc
-                .balance
-                .checked_add(tx.amount)
-                .ok_or_else(|| "recipient balance overflow".to_string())?;
+
+            if tx.from != tx.to {
+                to_acc.balance = to_acc
+                    .balance
+                    .checked_add(tx.amount)
+                    .ok_or_else(|| "recipient balance overflow".to_string())?;
+                let to_value = rlp::encode(&to_acc).to_vec();
+                temp_trie
+                    .insert(&to_key, &to_value)
+                    .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
+            } else {
+                // Self-send: refund the amount back to sender (fee is burned).
+                from_acc.balance = from_acc
+                    .balance
+                    .checked_add(tx.amount)
+                    .ok_or_else(|| "self-send refund overflow".to_string())?;
+            }
 
             let from_value = rlp::encode(&from_acc).to_vec();
-            let to_value = rlp::encode(&to_acc).to_vec();
             temp_trie
                 .insert(&from_key, &from_value)
                 .map_err(|e| format!("failed to insert sender into simulation: {}", e))?;
-            temp_trie
-                .insert(&to_key, &to_value)
-                .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
         }
 
         credit_reward_on_trie(
@@ -336,13 +357,11 @@ impl StateDB {
         fee: u64,
         nonce: u64,
     ) -> Result<(), String> {
-        // Defensive check: a self-transfer would cause the recipient
-        // update to overwrite the sender update because both addresses
-        // map to the same trie key. Rejecting it here guarantees that the
-        // state layer never creates coins, even if a caller bypasses the
-        // consensus validation layer.
+        // Allow self-send only for message transactions.
         if from == to {
-            return Err("self-transfer is not allowed".to_string());
+            if amount != rules::MIN_MESSAGE_AMOUNT {
+                return Err("self-transfer is only allowed for message transactions".to_string());
+            }
         }
 
         if amount == 0 {
@@ -391,15 +410,6 @@ impl StateDB {
             ));
         }
 
-        let mut to_acc = self.get_account(to)?.unwrap_or(Account {
-            nonce: 0,
-            balance: 0,
-            immature_rewards: Vec::new(),
-            code: Vec::new(),
-            storage: BTreeMap::new(),
-        });
-
-        // FIX: Use checked_sub to prevent underflow (coin creation)
         from_acc.balance = from_acc
             .balance
             .checked_sub(total)
@@ -409,13 +419,29 @@ impl StateDB {
             .nonce
             .checked_add(1)
             .ok_or_else(|| "sender nonce overflow".to_string())?;
-        to_acc.balance = to_acc
-            .balance
-            .checked_add(amount)
-            .ok_or_else(|| "recipient balance overflow".to_string())?;
+
+        if from != to {
+            let mut to_acc = self.get_account(to)?.unwrap_or(Account {
+                nonce: 0,
+                balance: 0,
+                immature_rewards: Vec::new(),
+                code: Vec::new(),
+                storage: BTreeMap::new(),
+            });
+            to_acc.balance = to_acc
+                .balance
+                .checked_add(amount)
+                .ok_or_else(|| "recipient balance overflow".to_string())?;
+            self.update_account(to, &to_acc)?;
+        } else {
+            // Self-send: refund the amount back to sender (fee is burned).
+            from_acc.balance = from_acc
+                .balance
+                .checked_add(amount)
+                .ok_or_else(|| "self-send refund overflow".to_string())?;
+        }
 
         self.update_account(from, &from_acc)?;
-        self.update_account(to, &to_acc)?;
 
         Ok(())
     }
