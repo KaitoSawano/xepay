@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use xepay_crypto::sha3_256_hex;
 
+use crate::consensus::rules;
 use crate::consensus::spec;
 use crate::dilithium::address;
 
@@ -57,6 +58,45 @@ impl Transaction {
         .finalize()
     }
 
+    /// Create a transaction that carries an on-chain message.
+    ///
+    /// The transaction is a self-send (from == to) with a minimal amount
+    /// so that the value is returned to the sender, mirroring the OP_RETURN
+    /// convention. The message is stored in the `note` field prefixed with
+    /// `[MSG]` followed by a hex-encoded payload.
+    pub fn new_message(
+        sender: &str,
+        fee: u64,
+        nonce: u64,
+        message: &str,
+    ) -> Result<Self, String> {
+        if message.is_empty() {
+            return Err("message must not be empty".into());
+        }
+        if message.len() > rules::MAX_MESSAGE_LEN {
+            return Err(format!(
+                "message exceeds {} bytes",
+                rules::MAX_MESSAGE_LEN
+            ));
+        }
+
+        let hex_payload = hex::encode(message.as_bytes());
+        let note = format!("{}{}", rules::MESSAGE_PREFIX, hex_payload);
+
+        if note.len() > rules::MAX_NOTE_LEN {
+            return Err("encoded message exceeds note size limit".into());
+        }
+
+        Ok(Self::new_with_note(
+            sender,
+            sender,
+            rules::MIN_MESSAGE_AMOUNT,
+            fee,
+            nonce,
+            note,
+        ))
+    }
+
     fn finalize(mut self) -> Self {
         self.txid = self.compute_txid();
         self
@@ -94,15 +134,22 @@ impl Transaction {
         .finalize()
     }
 
-    /// Compute the transaction ID.
-    ///
-    /// The txid is a hash of every field that affects the transaction's
-    /// validity, including `public_key` and `output_script`. This ensures
-    /// that any change to the transaction produces a different txid, which
-    /// prevents txid malleability.
-    ///
-    /// `public_key` and `signature` are hashed as raw bytes, not as hex.
-    /// This keeps the txid independent of the encoding used for storage.
+    /// Return true if this transaction is an on-chain message.
+    pub fn is_message_tx(&self) -> bool {
+        self.note.starts_with(rules::MESSAGE_PREFIX)
+    }
+
+    /// Decode the message body from a message transaction.
+    pub fn extract_message(&self) -> Option<String> {
+        if !self.is_message_tx() {
+            return None;
+        }
+
+        let body = &self.note[rules::MESSAGE_PREFIX.len()..];
+        let bytes = hex::decode(body).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
     pub fn compute_txid(&self) -> String {
         let mut payload = Vec::new();
         payload.extend_from_slice(self.from.as_bytes());
@@ -135,31 +182,19 @@ impl Transaction {
         sha3_256_hex(payload.as_bytes())
     }
 
-    /// Sign the transaction with the given secret key.
-    ///
-    /// The order of operations is important:
-    ///   1. Set `public_key` so that `signing_hash()` is complete.
-    ///   2. Compute the signing hash and sign it.
-    ///   3. Set `signature`.
-    ///   4. Compute `txid` **after** `public_key` and `signature` are set,
-    ///      so that the txid commits to the full transaction data.
     pub fn sign(&mut self, secret_hex: &str) -> Result<(), String> {
         use crate::dilithium::{keypair::KeyPair, sign};
 
         let sk = hex::decode(secret_hex).map_err(|e| e.to_string())?;
         let kp = KeyPair::from_secret(&sk)?;
 
-        // Step 1: set the public key as raw bytes.
         self.public_key = kp.public_key.clone();
 
-        // Step 2: compute the signing hash and sign it.
         let msg = hex::decode(self.signing_hash()).map_err(|e| e.to_string())?;
         let sig = sign::sign(&kp.secret_key, &msg)?;
 
-        // Step 3: set the signature as raw bytes.
         self.signature = sig;
 
-        // Step 4: compute the txid AFTER public_key and signature are set.
         self.txid = self.compute_txid();
 
         Ok(())
