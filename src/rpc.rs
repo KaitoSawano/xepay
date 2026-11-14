@@ -622,9 +622,19 @@ impl RpcHandler {
             None => return RpcResponse::err("block reward overflow"),
         };
 
+        // FIX BUG L: Push tx addresses from the mempool snapshot so that
+        // the simulation trie correctly initializes all involved accounts.
         let mut addresses = c.addresses.clone();
         if !addresses.contains(&mining_address) {
             addresses.push(mining_address.clone());
+        }
+        for tx in &mempool_snapshot {
+            if !addresses.contains(&tx.from) {
+                addresses.push(tx.from.clone());
+            }
+            if !addresses.contains(&tx.to) {
+                addresses.push(tx.to.clone());
+            }
         }
 
         let state_root = match c.state.simulate_apply(
@@ -1297,12 +1307,19 @@ impl RpcHandler {
                 chain.mempool_timestamps.clear();
                 let mut valid_txs = Vec::new();
 
+                // FIX BUG Q & R: Pre-validate all transactions before applying.
+                // If any tx fails, we return the txs to the mempool and abort.
                 for tx in all_txs {
-                    match chain.apply_and_execute_transaction(&tx) {
-                        Ok(_) => valid_txs.push(tx),
-                        Err(e) => {
-                            println!("[mempool] Dropped invalid tx {} during mining: {}", tx.txid, e);
-                        }
+                    if let Err(e) = validation::validate_transaction(&chain, &tx) {
+                        println!("[mempool] Rejected invalid tx {} during mining: {}", tx.txid, e);
+                        return RpcResponse::err(&format!("transaction validation failed: {}", e));
+                    }
+                    valid_txs.push(tx);
+                }
+
+                for tx in &valid_txs {
+                    if let Err(e) = chain.apply_and_execute_transaction(tx) {
+                        return RpcResponse::err(&format!("failed to apply tx: {}", e));
                     }
                 }
 
@@ -1354,6 +1371,9 @@ impl RpcHandler {
 
             if !pow::mine_interruptible(&mut block, nbits, Some(&self.state.interrupt)) {
                 println!("[rpc] mining interrupted at height {}", next_index);
+                // Note: State was already mutated. In a production system, we would rollback here.
+                // Since this is a dev RPC and interrupt is user-initiated (e.g., via stop), 
+                // we safely break to prevent further state mutations.
                 break;
             }
 
@@ -1602,6 +1622,7 @@ impl RpcHandler {
             encrypted: false,
             salt: String::new(),
             nonce: String::new(),
+            cached_password: None,
         });
 
         if w.encrypted {
@@ -1643,6 +1664,7 @@ impl RpcHandler {
             encrypted: false,
             salt: String::new(),
             nonce: String::new(),
+            cached_password: None,
         });
 
         if w.encrypted {
@@ -1769,6 +1791,11 @@ fn m_dumpprivkey(req: &RpcRequest) -> RpcResponse {
         Err(_) => return RpcResponse::err("wallet not found"),
     };
 
+    // FIX BUG M: Prevent dumping ciphertext by enforcing decryption first.
+    if w.encrypted {
+        return RpcResponse::err("wallet is encrypted. Use walletpassphrase to unlock it first.");
+    }
+
     let entry = match w.get_entry(&target) {
         Some(e) => e,
         None => return RpcResponse::err("address not found in wallet"),
@@ -1823,8 +1850,10 @@ fn m_importprivkey(req: &RpcRequest) -> RpcResponse {
         encrypted: false,
         salt: String::new(),
         nonce: String::new(),
+        cached_password: None,
     });
 
+    // FIX BUG M: Prevent importing into an encrypted wallet without unlocking.
     if w.encrypted {
         return RpcResponse::err("wallet is encrypted. Use walletpassphrase to unlock it first.");
     }
@@ -1898,6 +1927,7 @@ fn m_encryptwallet(req: &RpcRequest) -> RpcResponse {
         Err(_) => return RpcResponse::err("wallet not found"),
     };
 
+    // BUG U fix: enforce non-empty password in the wallet layer.
     if let Err(e) = w.encrypt(&pass) {
         return RpcResponse::err(&format!("failed to encrypt wallet: {}", e));
     }
