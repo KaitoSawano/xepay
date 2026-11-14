@@ -584,7 +584,7 @@ pub fn validate_transaction(chain: &Blockchain, tx: &Transaction) -> Result<(), 
 pub fn validate_block_transactions(
     chain: &mut Blockchain,
     transactions: &[Transaction],
-    _height: u64,
+    height: u64,
 ) -> Result<(), ValidationError> {
     let mut overlay_balances: BTreeMap<String, u64> = BTreeMap::new();
     let mut overlay_nonces: BTreeMap<String, u64> = BTreeMap::new();
@@ -608,10 +608,12 @@ pub fn validate_block_transactions(
             ));
         }
 
+        // FIX: Use the block height passed as an argument instead of chain.height()
+        // to ensure consensus consistency during historical validation or reorgs.
         let base_balance = overlay_balances
             .get(&tx.from)
             .copied()
-            .unwrap_or_else(|| chain.mature_balance_at(&tx.from, chain.height()));
+            .unwrap_or_else(|| chain.mature_balance_at(&tx.from, height));
 
         let need = match tx.amount.checked_add(tx.fee) {
             Some(v) => v,
@@ -624,7 +626,9 @@ pub fn validate_block_transactions(
             ));
         }
 
-        let new_from = base_balance - need;
+        // FIX: Use checked_sub to mathematically guarantee no underflow.
+        let new_from = base_balance.checked_sub(need)
+            .ok_or_else(|| ValidationError::new("E023", "underflow during overlay balance calculation"))?;
         overlay_balances.insert(tx.from.clone(), new_from);
 
         let to_balance = overlay_balances
