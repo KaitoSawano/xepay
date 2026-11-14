@@ -339,6 +339,13 @@ impl Blockchain {
         self.chain.last().unwrap().index
     }
 
+    pub fn height_from_state(state: &StateDB) -> u64 {
+        match state.get_account("GENESIS") {
+            Ok(Some(acc)) => acc.nonce,
+            _ => 0,
+        }
+    }
+
     pub fn circulating_supply(&self) -> u64 {
         self.chain.iter().fold(0u64, |acc, b| acc.saturating_add(b.reward))
     }
@@ -468,7 +475,11 @@ impl Blockchain {
     /// Calculate the current minimum fee per byte based on mempool pressure.
     /// The base fee is MIN_RELAY_FEE_PER_BYTE (1 ALD).
     /// As the mempool fills up, the minimum fee increases exponentially.
-    pub fn current_min_fee_per_byte(&self) -> u64 {
+    pub fn current_min_fee_per_byte(&mut self) -> u64 {
+        // FIX: Evict expired transactions before calculating size to prevent
+        // fee spikes caused by expired spam.
+        self.evict_expired_transactions();
+
         let size = self.mempool_size_bytes();
         let max = MAX_MEMPOOL_SIZE_BYTES;
         
@@ -536,6 +547,10 @@ impl Blockchain {
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> bool {
+        // FIX: Evict expired transactions before checking the limit
+        // to prevent the mempool from being permanently stuck.
+        self.evict_expired_transactions();
+
         if self.mempool.iter().any(|t| t.txid == tx.txid) {
             return false;
         }
@@ -630,6 +645,14 @@ impl Blockchain {
 
         let txs = std::mem::take(&mut self.mempool);
         self.mempool_timestamps.clear();
+
+        // FIX: Pre-validate all transactions before applying them to
+        // prevent state corruption if one of them fails mid-way.
+        for tx in &txs {
+            if let Err(e) = validation::validate_transaction(self, tx) {
+                return Err(format!("mempool transaction failed validation: {}", e));
+            }
+        }
 
         for tx in &txs {
             self.apply_and_execute_transaction(tx)?;
