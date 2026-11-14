@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use crate::block::Block;
 use crate::blockchain::Blockchain;
-use crate::transaction::Transaction;
 use crate::validation;
 
 pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
