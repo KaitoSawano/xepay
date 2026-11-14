@@ -206,6 +206,24 @@ fn main() {
             }
             rpc::call_and_print("sendtoaddress", params);
         }
+        "sendmessage" => {
+            if args.len() < 3 {
+                println!("usage: xepay sendmessage \"<message>\" [\"<from_address>\"] [fee_ald]");
+                return;
+            }
+            let mut params = vec![json!(args[2])];
+            for i in 3..args.len() {
+                params.push(json!(args[i]));
+            }
+            rpc::call_and_print("sendmessage", params);
+        }
+        "getmessages" => {
+            let mut params = Vec::new();
+            for i in 2..args.len() {
+                params.push(json!(args[i]));
+            }
+            rpc::call_and_print("getmessages", params);
+        }
         "getbalance" => {
             let params = if args.len() >= 3 {
                 vec![json!(args[2])]
@@ -297,6 +315,8 @@ fn print_help() {
     println!("  getaddtoaddress \"<address>\"         set a manual mining address");
     println!("  generatetoaddress <n> \"<address>\"   mine n blocks directly to the given address");
     println!("  sendtoaddress <amount> \"<to>\"       send coins to <to>. The wallet auto-selects a source address.");
+    println!("  sendmessage \"<msg>\" [from] [fee]   broadcast an on-chain message via self-send");
+    println!("  getmessages [address] [start] [end]  fetch on-chain messages");
     println!("  submitblock <block_json_file>       submit a block from a JSON file");
     println!("  dumpprivkey \"<address>\"             display the private key for the given address");
     println!("  dumpwallet                          dump all wallet addresses and private keys");
