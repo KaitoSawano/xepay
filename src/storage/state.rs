@@ -173,6 +173,13 @@ impl StateDB {
                 ));
             }
 
+            if tx.amount == 0 {
+                return Err(format!(
+                    "zero amount rejected during simulation: {}",
+                    tx.txid
+                ));
+            }
+
             let from_key = Self::address_key(&tx.from);
             let to_key = Self::address_key(&tx.to);
 
@@ -338,6 +345,10 @@ impl StateDB {
             return Err("self-transfer is not allowed".to_string());
         }
 
+        if amount == 0 {
+            return Err("amount must be greater than zero".to_string());
+        }
+
         let mut from_acc = self.get_account(from)?.unwrap_or(Account {
             nonce: 0,
             balance: 0,
@@ -356,6 +367,22 @@ impl StateDB {
         let total = amount
             .checked_add(fee)
             .ok_or_else(|| "amount + fee overflows u64".to_string())?;
+
+        // FIX: Mature the rewards before checking the balance to ensure
+        // consensus consistency across nodes regardless of transaction order.
+        let maturity = crate::consensus::rules::COINBASE_MATURITY;
+        let current_height = crate::blockchain::Blockchain::height_from_state(self);
+        
+        let mut still_immature = Vec::new();
+        for (height, reward_amount) in from_acc.immature_rewards.drain(..) {
+            if current_height >= height.saturating_add(maturity) {
+                from_acc.balance = from_acc.balance.checked_add(reward_amount)
+                    .ok_or_else(|| "balance overflow during maturity".to_string())?;
+            } else {
+                still_immature.push((height, reward_amount));
+            }
+        }
+        from_acc.immature_rewards = still_immature;
 
         if from_acc.balance < total {
             return Err(format!(
