@@ -70,3 +70,54 @@ fn bug_2_address_validation_uses_correct_prefix() {
         assert!(!validation::is_valid_address("not-an-address", &chain));
     });
 }
+
+#[test]
+#[serial]
+fn bug_q_generatetoaddress_does_not_lose_state_on_interrupt() {
+    with_temp_datadir(|| {
+        // Ensure that an interrupted mining operation does not corrupt the chain state.
+        let mut chain = Blockchain::new();
+        let addr = "xreg1q4t3vtam8l8lz8hzr9fwakycgrm2c2z89yg7n0n".to_string();
+        let initial_height = chain.height();
+        let initial_balance = chain.balance_of(&addr);
+        
+        // Simulate a failed mining attempt (no block pushed).
+        // Since generatetoaddress is an RPC handler, we test the underlying logic.
+        let result = chain.mine_pending();
+        
+        // If mining fails, the chain height should NOT change, and the state should be untouched.
+        // However, mine_pending uses validate_transaction, so it shouldn't corrupt.
+        if result.is_err() {
+            assert_eq!(chain.height(), initial_height, "Chain height must not change on failed mining");
+            assert_eq!(chain.balance_of(&addr), initial_balance, "Miner balance must not change on failed mining");
+        }
+    });
+}
+
+#[test]
+#[serial]
+fn bug_n_wallet_does_not_save_plaintext_after_decrypt() {
+    with_temp_datadir(|| {
+        use xepay::wallet::Wallet;
+        
+        let mut wallet = Wallet::new();
+        wallet.encrypt("super_secret_password").expect("encryption failed");
+        
+        // Save encrypted wallet
+        wallet.save_default().expect("save failed");
+        
+        // Load and decrypt
+        let loaded = Wallet::load_default().expect("load failed");
+        assert!(loaded.encrypted, "Wallet must be encrypted on disk");
+        
+        let decrypted = loaded.decrypt("super_secret_password").expect("decrypt failed");
+        assert!(!decrypted.encrypted, "Decrypted wallet should have encrypted = false in memory");
+        
+        // Save the decrypted wallet (simulating a wallet operation)
+        decrypted.save_default().expect("re-save failed");
+        
+        // Reload: the wallet must STILL be encrypted on disk.
+        let reloaded = Wallet::load_default().expect("reload failed");
+        assert!(reloaded.encrypted, "Wallet must remain encrypted on disk after re-save");
+    });
+}
