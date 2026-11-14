@@ -17,6 +17,11 @@ pub const USER_AGENT: &str = "/xepay:0.1.0/";
 
 pub const MAX_PAYLOAD_LEN: usize = 32 * 1024 * 1024;
 
+// FIX BUG AZ: Define reasonable limits for array lengths to prevent OOM.
+pub const MAX_INV_ITEMS: usize = 50_000;
+pub const MAX_ADDR_ITEMS: usize = 1_000;
+pub const MAX_HEADERS_ITEMS: usize = 5_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InvType {
     Transaction = 1,
@@ -334,6 +339,10 @@ impl Message {
             "verack" => Ok(Message::Verack),
             "inv" | "getdata" => {
                 let count = read_varint(&mut input)? as usize;
+                // FIX BUG AZ: Enforce a maximum count to prevent OOM panic.
+                if count > MAX_INV_ITEMS {
+                    return Err(format!("inv: too many items ({})", count));
+                }
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
                     if input.len() < 4 + 32 {
@@ -359,6 +368,9 @@ impl Message {
                 let version = u32::from_le_bytes(input[..4].try_into().unwrap());
                 input = &input[4..];
                 let count = read_varint(&mut input)? as usize;
+                if count > MAX_HEADERS_ITEMS {
+                    return Err(format!("getheaders: too many locator hashes ({})", count));
+                }
                 let mut locator_hashes = Vec::with_capacity(count);
                 for _ in 0..count {
                     if input.len() < 32 {
@@ -379,6 +391,9 @@ impl Message {
             }
             "headers" => {
                 let count = read_varint(&mut input)? as usize;
+                if count > MAX_HEADERS_ITEMS {
+                    return Err(format!("headers: too many headers ({})", count));
+                }
                 let mut headers = Vec::with_capacity(count);
                 for _ in 0..count {
                     if input.len() < 4 + 8 + 16 + 32 + 32 + 8 + 4 + 8 + 32 + 1 {
@@ -431,6 +446,10 @@ impl Message {
             }
             "addr" => {
                 let count = read_varint(&mut input)? as usize;
+                // FIX BUG AZ: Enforce a maximum count to prevent OOM panic.
+                if count > MAX_ADDR_ITEMS {
+                    return Err(format!("addr: too many items ({})", count));
+                }
                 let mut addrs = Vec::with_capacity(count);
                 for _ in 0..count {
                     addrs.push(read_netaddr(&mut input)?);
