@@ -96,14 +96,17 @@ fn transaction_with_self_send_is_rejected() {
 }
 
 #[test]
+#[serial]
 fn address_format_validation() {
-    let kp = KeyPair::generate().expect("keypair generation failed");
-    let valid_addr = address::address_from_public_key(&kp.public_key).expect("address failed");
+    with_temp_datadir(|| {
+        let kp = KeyPair::generate().expect("keypair generation failed");
+        let valid_addr = address::address_from_public_key(&kp.public_key).expect("address failed");
 
-    let chain = Blockchain::new();
-    assert!(validation::is_valid_address(&valid_addr, &chain));
-    assert!(!validation::is_valid_address("XEPC123", &chain));
-    assert!(!validation::is_valid_address("not-an-address", &chain));
+        let chain = Blockchain::new();
+        assert!(validation::is_valid_address(&valid_addr, &chain));
+        assert!(!validation::is_valid_address("XEPC123", &chain));
+        assert!(!validation::is_valid_address("not-an-address", &chain));
+    });
 }
 
 #[test]
