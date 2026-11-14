@@ -48,21 +48,17 @@ impl Block {
             return sha3_256_hex(b"empty");
         }
 
-        let mut layer: Vec<[u8; 32]> = transactions
-            .iter()
-            .filter_map(|tx| {
-                let bytes = hex::decode(&tx.txid).ok()?;
-                if bytes.len() != 32 {
-                    return None;
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(arr)
-            })
-            .collect();
-
-        if layer.is_empty() {
-            return sha3_256_hex(b"empty");
+        // FIX BUG AG: Use explicit loop and propagate error for invalid txids
+        // instead of silently skipping them, which causes a DoS via merkle mismatch.
+        let mut layer: Vec<[u8; 32]> = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let bytes = match hex::decode(&tx.txid) {
+                Ok(b) if b.len() == 32 => b,
+                _ => return sha3_256_hex(b"invalid_txid"),
+            };
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            layer.push(arr);
         }
 
         while layer.len() > 1 {
