@@ -11,6 +11,7 @@ mod genesis_test;
 mod halving_test;
 mod hash_test;
 mod dilithium_test;
+mod message_test;
 mod pow_test;
 mod security_hardening_test;
 mod sendtoaddress_test;
