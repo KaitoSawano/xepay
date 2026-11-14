@@ -85,6 +85,11 @@ impl Config {
                 "listen" => cfg.listen_addr = normalize_listen_addr(value),
                 "bootstrap" => cfg.bootstrap.push(value.to_string()),
                 "miningaddress" => cfg.mining_address = value.to_string(),
+                "protocolversion" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        cfg.protocol_version = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -107,6 +112,7 @@ impl Config {
         out.push_str(&format!("port={}\n", port));
         out.push_str(&format!("listen={}\n", self.listen_addr));
         out.push_str(&format!("miningaddress={}\n", self.mining_address));
+        out.push_str(&format!("protocolversion={}\n", self.protocol_version));
 
         for b in &self.bootstrap {
             out.push_str(&format!("bootstrap={}\n", b));
