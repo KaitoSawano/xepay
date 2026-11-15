@@ -17,7 +17,7 @@ pub const LEGACY_PREFIX_MAIN: u8 = 0x4b; // HARD FORK: "X" prefix
 pub const LEGACY_PREFIX_TEST: u8 = 0x6f;
 pub const LEGACY_PREFIX_REGTEST: u8 = 0x6f;
 
-pub const BECH32_HRP_MAIN: &str = "xepay";
+pub const BECH32_HRP_MAIN: &str = "xepc";
 pub const BECH32_HRP_TEST: &str = "xtes";
 pub const BECH32_HRP_REGTEST: &str = "xreg";
 
@@ -181,8 +181,8 @@ pub mod checkpoint {
     }
 
     pub const CHECKPOINTS: &[Checkpoint] = &[Checkpoint {
-        height: 1000,
-        hash: "000000033be44b327cd3ec8b1184de56df9fce9c00e72eba28d58e5f567ba5dc",
+        height: 0,
+        hash: "0000000000000000000000000000000000000000000000000000000000000000",
     }];
 
     pub fn find(height: u64) -> Option<&'static str> {
@@ -321,11 +321,6 @@ impl Blockchain {
                 .expect("failed to init genesis account");
         }
 
-        // FIX: Do NOT overwrite genesis.state_root. The genesis block's
-        // state_root must remain empty so that its hash matches
-        // EXPECTED_GENESIS_HASH. The state trie is initialized separately,
-        // and the genesis block does not commit to any state root.
-
         Blockchain {
             chain: vec![genesis],
             nbits: spec::current_network().genesis_nbits(),
@@ -353,25 +348,13 @@ impl Blockchain {
         self.chain.iter().fold(0u64, |acc, b| acc.saturating_add(b.reward))
     }
 
-    /// Calculate the block reward at the given height.
-    ///
-    /// The reward starts at `INITIAL_REWARD` and is reduced by 10% per era
-    /// (every `SUBSIDY_HALVING_INTERVAL` blocks). After `MAX_ERAS`, the
-    /// reward becomes zero.
-    ///
-    /// Formula: `reward = INITIAL_REWARD × (9/10)^era`
-    /// In integer math: `reward = INITIAL_REWARD × 9^era / 10^era`
     pub fn calculate_reward(height: u64) -> u64 {
         let era = (height / spec::SUBSIDY_HALVING_INTERVAL) as u32;
 
-        // If we've passed MAX_ERAS, reward is zero.
         if era >= spec::MAX_ERAS {
             return 0;
         }
 
-        // reward = INITIAL_REWARD × (9/10)^era
-        // To avoid floating point, use integer math:
-        // reward = INITIAL_REWARD × 9^era / 10^era
         let mut reward = spec::INITIAL_REWARD;
 
         for _ in 0..era {
@@ -456,7 +439,14 @@ impl Blockchain {
             ));
         }
 
-        self.state.apply_transaction(&tx.from, &tx.to, tx.amount, tx.fee, tx.nonce)?;
+        self.state.apply_transaction(
+            &tx.from,
+            &tx.to,
+            tx.amount,
+            tx.fee,
+            tx.nonce,
+            self.height(),
+        )?;
 
         Ok(())
     }
@@ -468,7 +458,14 @@ impl Blockchain {
         if !self.addresses.contains(&tx.to) {
             self.addresses.push(tx.to.clone());
         }
-        self.state.apply_transaction(&tx.from, &tx.to, tx.amount, tx.fee, tx.nonce)
+        self.state.apply_transaction(
+            &tx.from,
+            &tx.to,
+            tx.amount,
+            tx.fee,
+            tx.nonce,
+            self.height(),
+        )
     }
 
     pub fn credit_reward(&mut self, miner: &str, reward: u64, block_height: u64) -> Result<(), String> {
@@ -496,28 +493,19 @@ impl Blockchain {
         tx.fee / size
     }
 
-    /// Calculate the current minimum fee per byte based on mempool pressure.
-    /// The base fee is MIN_RELAY_FEE_PER_BYTE (1 ALD).
-    /// As the mempool fills up, the minimum fee increases exponentially.
     pub fn current_min_fee_per_byte(&mut self) -> u64 {
-        // FIX: Evict expired transactions before calculating size to prevent
-        // fee spikes caused by expired spam.
         self.evict_expired_transactions();
 
         let size = self.mempool_size_bytes();
         let max = MAX_MEMPOOL_SIZE_BYTES;
         
         if size < max / 2 {
-            // Mempool is less than 50% full. Use the base minimum.
             MIN_RELAY_FEE_PER_BYTE
         } else if size < (max * 3) / 4 {
-            // Mempool is 50%-75% full. Double the minimum fee.
             MIN_RELAY_FEE_PER_BYTE * 2
         } else if size < (max * 9) / 10 {
-            // Mempool is 75%-90% full. Five times the minimum fee.
             MIN_RELAY_FEE_PER_BYTE * 5
         } else {
-            // Mempool is >90% full. Ten times the minimum fee.
             MIN_RELAY_FEE_PER_BYTE * 10
         }
     }
@@ -571,8 +559,6 @@ impl Blockchain {
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> bool {
-        // FIX: Evict expired transactions before checking the limit
-        // to prevent the mempool from being permanently stuck.
         self.evict_expired_transactions();
 
         if self.mempool.iter().any(|t| t.txid == tx.txid) {
@@ -621,7 +607,6 @@ impl Blockchain {
         let tx_size = Self::tx_size_bytes(&tx);
         let fee_rate = Self::fee_rate(&tx);
         
-        // === DYNAMIC FEE MARKET ===
         let current_min_fee = self.current_min_fee_per_byte();
         if fee_rate < current_min_fee {
             println!(
@@ -670,8 +655,6 @@ impl Blockchain {
         let txs = std::mem::take(&mut self.mempool);
         self.mempool_timestamps.clear();
 
-        // FIX: Pre-validate all transactions before applying them to
-        // prevent state corruption if one of them fails mid-way.
         for tx in &txs {
             if let Err(e) = validation::validate_transaction(self, tx) {
                 return Err(format!("mempool transaction failed validation: {}", e));
