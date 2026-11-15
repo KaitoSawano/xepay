@@ -17,7 +17,7 @@ pub const LEGACY_PREFIX_MAIN: u8 = 0x4b; // HARD FORK: "X" prefix
 pub const LEGACY_PREFIX_TEST: u8 = 0x6f;
 pub const LEGACY_PREFIX_REGTEST: u8 = 0x6f;
 
-pub const BECH32_HRP_MAIN: &str = "xepc";
+pub const BECH32_HRP_MAIN: &str = "xepay";
 pub const BECH32_HRP_TEST: &str = "xtes";
 pub const BECH32_HRP_REGTEST: &str = "xreg";
 
