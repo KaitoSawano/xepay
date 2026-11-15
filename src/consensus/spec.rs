@@ -129,7 +129,7 @@ pub const UNIT_NAME: &str = "Aldian";
 /// Symbol of the smallest unit.
 pub const UNIT_SYMBOL: &str = "ALD";
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.3.0";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const HASH_ALGO: &str = "SHA3-256";
