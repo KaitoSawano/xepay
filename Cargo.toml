@@ -10,7 +10,7 @@ members = [
 
 [package]
 name = "xepay"
-version = "0.4.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "XEPAY (XEPC) node, CLI, and miner with ML-DSA-65 signatures"
