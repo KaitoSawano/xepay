@@ -292,14 +292,6 @@ impl StateDB {
     /// Mature balance = `acc.balance` + sum of `immature_rewards` whose
     /// maturity height has been reached. Rewards that are still immature
     /// are NOT included.
-    ///
-    /// NOTE: `acc.balance` only contains rewards that were explicitly
-    /// moved to the mature balance by `credit_reward`. In the current
-    /// implementation, `credit_reward` does NOT move rewards to
-    /// `acc.balance`; instead, it keeps them in `immature_rewards` and
-    /// lets `mature_balance_at` decide which are mature. Therefore,
-    /// `acc.balance` is always 0 for mining rewards, and the mature
-    /// balance is computed entirely from `immature_rewards`.
     pub fn mature_balance_at(&self, address: &str, current_height: u64) -> u64 {
         match self.get_account(address) {
             Ok(Some(acc)) => {
@@ -383,6 +375,7 @@ impl StateDB {
         amount: u64,
         fee: u64,
         nonce: u64,
+        current_height: u64,
     ) -> Result<(), String> {
         if from == to {
             if amount != rules::MIN_MESSAGE_AMOUNT {
@@ -413,13 +406,14 @@ impl StateDB {
             .checked_add(fee)
             .ok_or_else(|| "amount + fee overflows u64".to_string())?;
 
+        // Calculate mature balance from immature_rewards at current_height.
         let maturity = crate::consensus::rules::COINBASE_MATURITY;
-        let current_height = crate::blockchain::Blockchain::height_from_state(self);
-
+        let mut mature_balance = from_acc.balance;
         let mut still_immature = Vec::new();
         for (height, reward_amount) in from_acc.immature_rewards.drain(..) {
             if current_height >= height.saturating_add(maturity) {
-                from_acc.balance = from_acc.balance.checked_add(reward_amount)
+                mature_balance = mature_balance
+                    .checked_add(reward_amount)
                     .ok_or_else(|| "balance overflow during maturity".to_string())?;
             } else {
                 still_immature.push((height, reward_amount));
@@ -427,18 +421,18 @@ impl StateDB {
         }
         from_acc.immature_rewards = still_immature;
 
-        if from_acc.balance < total {
+        if mature_balance < total {
             return Err(format!(
                 "insufficient mature balance: required {}, available {}",
-                total, from_acc.balance
+                total, mature_balance
             ));
         }
 
-        from_acc.balance = from_acc
-            .balance
+        let remaining_mature = mature_balance
             .checked_sub(total)
             .ok_or_else(|| "underflow during deduction".to_string())?;
 
+        from_acc.balance = remaining_mature;
         from_acc.nonce = from_acc
             .nonce
             .checked_add(1)
@@ -476,12 +470,6 @@ impl StateDB {
     /// which counts immature rewards whose maturity height has been
     /// reached. This means `acc.balance` is NOT updated by this function;
     /// it remains 0 for mining rewards.
-    ///
-    /// NOTE: This is a change from the previous implementation, which
-    /// moved matured rewards to `acc.balance`. That caused double-counting
-    /// because `mature_balance_at` also counted matured rewards. The new
-    /// approach keeps all rewards in `immature_rewards` and computes
-    /// maturity on demand.
     pub fn credit_reward(
         &mut self,
         miner: &str,
@@ -496,9 +484,6 @@ impl StateDB {
             storage: BTreeMap::new(),
         });
 
-        // Just push the new reward to immature_rewards. Do NOT move
-        // matured rewards to acc.balance here. Maturity is computed
-        // lazily by mature_balance_at.
         acc.immature_rewards.push((block_height, reward));
 
         self.update_account(miner, &acc)?;
@@ -544,11 +529,6 @@ fn read_account_from_trie<D: DB>(
 }
 
 /// Apply a block reward to the miner account in the given trie.
-///
-/// This mirrors `StateDB::credit_reward` but operates on any trie, which
-/// allows the simulation to use an in-memory trie. The reward is added
-/// to `immature_rewards` and is NOT moved to `acc.balance`. Maturity is
-/// computed lazily by `mature_balance_at`.
 fn credit_reward_on_trie<D: DB>(
     trie: &mut EthTrie<D>,
     miner: &str,
