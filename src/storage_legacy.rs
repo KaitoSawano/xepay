@@ -190,8 +190,14 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
     for block in blocks.iter().skip(1) {
         for tx in &block.transactions {
             if !validation::is_special_tx(tx) {
-                chain.state.apply_transaction(&tx.from, &tx.to, tx.amount, tx.fee, tx.nonce)
-                    .map_err(|e| Error::other(format!("Failed to apply tx {}: {}", tx.txid, e)))?;
+                chain.state.apply_transaction(
+                    &tx.from,
+                    &tx.to,
+                    tx.amount,
+                    tx.fee,
+                    tx.nonce,
+                    block.index,
+                ).map_err(|e| Error::other(format!("Failed to apply tx {}: {}", tx.txid, e)))?;
             }
         }
         chain.state.credit_reward(&block.mined_for, block.reward, block.index)
