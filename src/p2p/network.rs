@@ -356,6 +356,10 @@ impl Network {
                     if self.banman.is_banned(addr) || self.banman.is_discouraged(&addr.ip()) {
                         return false;
                     }
+                    // BYPASS ASMAP: Always allow local/private network connections.
+                    if addr.ip().is_loopback() || addr.ip().is_private() {
+                        return true;
+                    }
                     let asn = self.ip_to_asn(addr.ip());
                     !connected_asns.contains(&asn)
                 })
@@ -374,6 +378,10 @@ impl Network {
                 .find(|addr| {
                     if self.banman.is_banned(addr) || self.banman.is_discouraged(&addr.ip()) {
                         return false;
+                    }
+                    // BYPASS ASMAP: Always allow local/private network connections.
+                    if addr.ip().is_loopback() || addr.ip().is_private() {
+                        return true;
                     }
                     let asn = self.ip_to_asn(addr.ip());
                     !connected_asns.contains(&asn)
