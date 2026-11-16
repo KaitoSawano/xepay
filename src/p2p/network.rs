@@ -1152,6 +1152,20 @@ impl Network {
                 PeerEvent::Disconnected(id, reason) => {
                     self.connections.remove(&id);
                     println!("[p2p] peer {} disconnected: {}", id, reason);
+
+                    // ADDED: Auto-reconnect logic for outbound peers.
+                    // When the connection drops, we re-add the address to the address book
+                    // and reset its last try time so it can be picked up in the next
+                    // try_connect loop without waiting for the 60-second cooldown.
+                    if let Some(peer) = self.peer_manager.get(id) {
+                        if peer.outbound {
+                            let addr = peer.addr;
+                            if !self.banman.is_banned(&addr) {
+                                self.addr_book.add(addr);
+                                self.addr_book.reset_try(addr);
+                            }
+                        }
+                    }
                 }
                 PeerEvent::Banned(id, reason) => {
                     println!("[p2p] peer {} banned: {}", id, reason);
