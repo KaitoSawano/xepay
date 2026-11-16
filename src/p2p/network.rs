@@ -1067,9 +1067,8 @@ impl Network {
                     hash: block.hash.clone(),
                 }]);
 
-                // Immediately request the next batch of headers if we
-                // are still behind. This prevents sync stalls at batch
-                // boundaries.
+                // ADDED: Immediately request the next batch of headers and blocks
+                // to keep the sync pipeline full and avoid stalling at 16 blocks.
                 self.send_getheaders(id).await;
 
                 println!("[p2p] block {} accepted from {}", block.index, id);
