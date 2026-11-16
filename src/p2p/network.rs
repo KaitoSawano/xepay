@@ -348,17 +348,6 @@ impl Network {
         }
 
         if self.peer_manager.can_add_outbound_full_relay() {
-            // DEBUG: Force connect to bootstrap on startup
-            if self.addr_book.len() > 0 && self.peer_manager.outbound_full_relay_count() == 0 {
-                let addrs = self.addr_book.candidates(Duration::from_secs(0), 1);
-                if let Some(&addr) = addrs.first() {
-                    println!("[p2p] FORCE CONNECTING TO BOOTSTRAP {}", addr);
-                    self.attempt_connect(addr, ConnectionType::OutboundFullRelay, 0).await;
-                    self.next_connect_at = Instant::now() + self.config.connect_interval;
-                    return;
-                }
-            }
-
             if let Some(addr) = self
                 .addr_book
                 .candidates(Duration::from_secs(60), 10)
