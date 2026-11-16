@@ -1022,11 +1022,8 @@ impl Network {
                 self.punish(id, 50, &format!("invalid header PoW: {}", e)).await;
                 return;
             }
-            if let Err(e) = validation::rule_block_hash_consistent(h) {
-                drop(chain);
-                self.punish(id, 50, &format!("invalid header hash: {}", e)).await;
-                return;
-            }
+            // REMOVED: rule_block_hash_consistent check to allow header sync without transactions.
+            // The full block will be validated later in sync.rs.
             if let Err(e) = validation::rule_block_nbits(&chain, h) {
                 drop(chain);
                 self.punish(id, 50, &format!("invalid header nbits: {}", e)).await;
