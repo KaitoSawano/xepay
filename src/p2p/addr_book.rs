@@ -97,6 +97,14 @@ impl AddrBook {
         false
     }
 
+    /// Reset the last_try time so the address can be tried again immediately.
+    pub fn reset_try(&mut self, addr: SocketAddr) {
+        if let Some(entry) = self.entries.get_mut(&addr) {
+            entry.last_try = None;
+            entry.failures = 0;
+        }
+    }
+
     /// Return candidate addresses that have not been attempted recently.
     pub fn candidates(&self, min_interval: Duration, limit: usize) -> Vec<SocketAddr> {
         let now = Instant::now();
