@@ -357,7 +357,11 @@ impl Network {
                         return false;
                     }
                     // BYPASS ASMAP: Always allow local/private network connections.
-                    if addr.ip().is_loopback() || addr.ip().is_private() {
+                    let is_local = match addr.ip() {
+                        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+                        IpAddr::V6(ip) => ip.is_loopback(),
+                    };
+                    if is_local {
                         return true;
                     }
                     let asn = self.ip_to_asn(addr.ip());
@@ -380,7 +384,11 @@ impl Network {
                         return false;
                     }
                     // BYPASS ASMAP: Always allow local/private network connections.
-                    if addr.ip().is_loopback() || addr.ip().is_private() {
+                    let is_local = match addr.ip() {
+                        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+                        IpAddr::V6(ip) => ip.is_loopback(),
+                    };
+                    if is_local {
                         return true;
                     }
                     let asn = self.ip_to_asn(addr.ip());
