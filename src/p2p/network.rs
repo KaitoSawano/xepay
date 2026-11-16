@@ -1062,14 +1062,15 @@ impl Network {
                 self.inv.add_block(&block.hash);
                 let _ = storage::save_chain(&mut chain);
                 drop(chain);
+                
+                // NEW FIX: Immediately request the next batch of headers and blocks
+                // to keep the sync pipeline full and prevent stalling at 16 blocks.
+                self.send_getheaders(id).await;
+
                 self.broadcast_inv_to_full_relay(&[Inventory {
                     inv_type: InvType::Block,
                     hash: block.hash.clone(),
                 }]);
-
-                // ADDED: Immediately request the next batch of headers and blocks
-                // to keep the sync pipeline full and avoid stalling at 16 blocks.
-                self.send_getheaders(id).await;
 
                 println!("[p2p] block {} accepted from {}", block.index, id);
             }
