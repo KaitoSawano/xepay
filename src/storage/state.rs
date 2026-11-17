@@ -18,10 +18,6 @@ use crate::consensus::rules;
 pub struct StateDB {
     trie: EthTrie<LevelDbAdapter>,
     adapter: Arc<LevelDbAdapter>,
-    /// The root hash of the trie after the most recent insertion or
-    /// rollback. The trie implementation does not reliably report the
-    /// current root through `root_hash()` after an insertion, so the
-    /// root is cached here and updated on every mutation.
     cached_root: B256,
 }
 
@@ -91,13 +87,8 @@ impl StateDB {
         Ok(arr)
     }
 
-    /// Verify that a trie root is present in the backing database before
-    /// switching to it. Without this check, `EthTrie::from` silently accepts
-    /// an arbitrary root because no node is loaded, and `root_hash` then
-    /// returns the same value even though the database has no data for it.
     pub fn rollback_to(&mut self, root_hash: &[u8; 32]) -> Result<(), String> {
         let root = B256::from_slice(root_hash);
-
         let empty_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
         if root != empty_root {
             if self.adapter.get(root.as_slice()).map_err(|e| e.to_string())?.is_none() {
@@ -107,265 +98,11 @@ impl StateDB {
                 ));
             }
         }
-
         let new_trie = EthTrie::from(self.adapter.clone(), root)
             .map_err(|e| format!("failed to create trie from root: {}", e))?;
-
         self.trie = new_trie;
         self.cached_root = root;
         Ok(())
-    }
-
-    /// Create a temporary snapshot of the current state without modifying
-    /// the original. The snapshot shares the backing database with the
-    /// original, so it must not be used to apply transactions unless the
-    /// caller accepts that the writes reach the shared database. Callers
-    /// that need a read-only simulation must use `simulate_apply` instead.
-    pub fn rollback_snapshot(&mut self) -> Result<StateDB, String> {
-        let root_b256 = self.cached_root;
-
-        let new_trie = EthTrie::from(self.adapter.clone(), root_b256)
-            .map_err(|e| format!("failed to create snapshot trie: {}", e))?;
-
-        Ok(StateDB {
-            trie: new_trie,
-            adapter: self.adapter.clone(),
-            cached_root: root_b256,
-        })
-    }
-
-    /// Simulate applying a list of transactions and crediting the block
-    /// reward, then return the state root that would result. The
-    /// simulation builds an in-memory copy of the current trie from the
-    /// supplied address list, applies the transactions to that copy,
-    /// credits the reward to the miner, and reads the resulting root.
-    /// The persistent database is never written to, so the live state is
-    /// not affected.
-    pub fn simulate_apply(
-        &self,
-        addresses: &[String],
-        transactions: &[crate::transaction::Transaction],
-        miner: &str,
-        reward: u64,
-        block_height: u64,
-    ) -> Result<[u8; 32], String> {
-        let memory_db = Arc::new(MemoryDb::new());
-        let mut temp_trie = EthTrie::new(memory_db.clone());
-
-        for address in addresses {
-            if let Some(account) = self.get_account(address)? {
-                let key = Self::address_key(address);
-                let value = rlp::encode(&account).to_vec();
-                temp_trie
-                    .insert(&key, &value)
-                    .map_err(|e| format!("failed to seed simulation trie: {}", e))?;
-            }
-        }
-
-        for tx in transactions {
-            if crate::validation::is_special_tx(tx) {
-                continue;
-            }
-
-            let is_message = tx.is_message_tx();
-
-            if tx.from == tx.to {
-                if !is_message || tx.amount != rules::MIN_MESSAGE_AMOUNT {
-                    return Err(format!(
-                        "self-transfer rejected during simulation: {}",
-                        tx.txid
-                    ));
-                }
-            } else if is_message {
-                return Err(format!(
-                    "message transaction must be a self-send: {}",
-                    tx.txid
-                ));
-            }
-
-            if tx.amount == 0 {
-                return Err(format!(
-                    "zero amount rejected during simulation: {}",
-                    tx.txid
-                ));
-            }
-
-            let from_key = Self::address_key(&tx.from);
-            let to_key = Self::address_key(&tx.to);
-
-            let mut from_acc = read_account_from_trie(&mut temp_trie, &from_key)?
-                .unwrap_or_else(empty_account);
-            let mut to_acc = if tx.from != tx.to {
-                read_account_from_trie(&mut temp_trie, &to_key)?.unwrap_or_else(empty_account)
-            } else {
-                empty_account()
-            };
-
-            if from_acc.nonce != tx.nonce {
-                return Err(format!(
-                    "invalid nonce for {}: got {}, expected {}",
-                    tx.from, tx.nonce, from_acc.nonce
-                ));
-            }
-
-            let total = tx
-                .amount
-                .checked_add(tx.fee)
-                .ok_or_else(|| "amount + fee overflows u64".to_string())?;
-            if from_acc.balance < total {
-                return Err(format!(
-                    "insufficient balance for {}: required {}, available {}",
-                    tx.from, total, from_acc.balance
-                ));
-            }
-
-            from_acc.balance = from_acc
-                .balance
-                .checked_sub(total)
-                .ok_or_else(|| "underflow during simulation".to_string())?;
-
-            from_acc.nonce = from_acc
-                .nonce
-                .checked_add(1)
-                .ok_or_else(|| "sender nonce overflow".to_string())?;
-
-            if tx.from != tx.to {
-                to_acc.balance = to_acc
-                    .balance
-                    .checked_add(tx.amount)
-                    .ok_or_else(|| "recipient balance overflow".to_string())?;
-                let to_value = rlp::encode(&to_acc).to_vec();
-                temp_trie
-                    .insert(&to_key, &to_value)
-                    .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
-            } else {
-                // Self-send: refund the amount back to sender (fee is burned).
-                from_acc.balance = from_acc
-                    .balance
-                    .checked_add(tx.amount)
-                    .ok_or_else(|| "self-send refund overflow".to_string())?;
-            }
-
-            let from_value = rlp::encode(&from_acc).to_vec();
-            temp_trie
-                .insert(&from_key, &from_value)
-                .map_err(|e| format!("failed to insert sender into simulation: {}", e))?;
-        }
-
-        credit_reward_on_trie(
-            &mut temp_trie,
-            miner,
-            reward,
-            block_height,
-            crate::consensus::rules::COINBASE_MATURITY,
-        )?;
-
-        let root = temp_trie
-            .root_hash()
-            .map_err(|e| format!("failed to compute simulation root: {}", e))?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(root.as_slice());
-        Ok(arr)
-    }
-
-    /// Return the total balance of an address.
-    ///
-    /// Total balance = `acc.balance` (mature) + sum of all
-    /// `immature_rewards` (whether mature or not). This is the amount
-    /// that would be available if all immature rewards were mature.
-    pub fn balance_of(&self, address: &str) -> u64 {
-        match self.get_account(address) {
-            Ok(Some(acc)) => {
-                let immature: u64 = acc
-                    .immature_rewards
-                    .iter()
-                    .map(|(_, a)| *a)
-                    .fold(0u64, |acc, x| acc.saturating_add(x));
-                acc.balance.saturating_add(immature)
-            }
-            _ => 0,
-        }
-    }
-
-    /// Return the mature balance of an address at the given height.
-    ///
-    /// Mature balance = `acc.balance` + sum of `immature_rewards` whose
-    /// maturity height has been reached. Rewards that are still immature
-    /// are NOT included.
-    pub fn mature_balance_at(&self, address: &str, current_height: u64) -> u64 {
-        match self.get_account(address) {
-            Ok(Some(acc)) => {
-                let maturity = crate::consensus::rules::COINBASE_MATURITY;
-                let mut mature = acc.balance;
-                for (height, amount) in &acc.immature_rewards {
-                    if current_height >= height.saturating_add(maturity) {
-                        mature = mature.saturating_add(*amount);
-                    }
-                }
-                mature
-            }
-            _ => 0,
-        }
-    }
-
-    /// Return the mature balance of an address using the given height.
-    pub fn mature_balance_of(&self, address: &str, current_height: u64) -> u64 {
-        self.mature_balance_at(address, current_height)
-    }
-
-    /// Return the immature balance of an address at the given height.
-    ///
-    /// Immature balance = sum of `immature_rewards` whose maturity
-    /// height has NOT been reached yet.
-    pub fn immature_balance_of(&self, address: &str, current_height: u64) -> u64 {
-        match self.get_account(address) {
-            Ok(Some(acc)) => {
-                let maturity = crate::consensus::rules::COINBASE_MATURITY;
-                acc.immature_rewards
-                    .iter()
-                    .filter(|(height, _)| current_height < height.saturating_add(maturity))
-                    .map(|(_, amount)| *amount)
-                    .sum()
-            }
-            _ => 0,
-        }
-    }
-
-    pub fn nonce_of(&self, address: &str) -> u64 {
-        match self.get_account(address) {
-            Ok(Some(acc)) => acc.nonce,
-            _ => 0,
-        }
-    }
-
-    pub fn get_code(&self, address: &str) -> Vec<u8> {
-        match self.get_account(address) {
-            Ok(Some(acc)) => acc.code.clone(),
-            _ => Vec::new(),
-        }
-    }
-
-    pub fn get_storage(&self, address: &str) -> BTreeMap<[u8; 32], [u8; 32]> {
-        match self.get_account(address) {
-            Ok(Some(acc)) => acc.storage.clone(),
-            _ => BTreeMap::new(),
-        }
-    }
-
-    pub fn set_storage(
-        &mut self,
-        address: &str,
-        storage: BTreeMap<[u8; 32], [u8; 32]>,
-    ) -> Result<(), String> {
-        let mut acc = self.get_account(address)?.unwrap_or(Account {
-            nonce: 0,
-            balance: 0,
-            immature_rewards: Vec::new(),
-            code: Vec::new(),
-            storage: BTreeMap::new(),
-        });
-        acc.storage = storage;
-        self.update_account(address, &acc)
     }
 
     pub fn apply_transaction(
@@ -382,7 +119,6 @@ impl StateDB {
                 return Err("self-transfer is only allowed for message transactions".to_string());
             }
         }
-
         if amount == 0 {
             return Err("amount must be greater than zero".to_string());
         }
@@ -406,7 +142,6 @@ impl StateDB {
             .checked_add(fee)
             .ok_or_else(|| "amount + fee overflows u64".to_string())?;
 
-        // Calculate mature balance from immature_rewards at current_height.
         let maturity = crate::consensus::rules::COINBASE_MATURITY;
         let mut mature_balance = from_acc.balance;
         let mut still_immature = Vec::new();
@@ -459,17 +194,9 @@ impl StateDB {
         }
 
         self.update_account(from, &from_acc)?;
-
         Ok(())
     }
 
-    /// Credit a block reward to the miner account.
-    ///
-    /// The reward is added to `immature_rewards` and stays there until
-    /// it matures. Maturity is computed lazily by `mature_balance_at`,
-    /// which counts immature rewards whose maturity height has been
-    /// reached. This means `acc.balance` is NOT updated by this function;
-    /// it remains 0 for mining rewards.
     pub fn credit_reward(
         &mut self,
         miner: &str,
@@ -483,9 +210,7 @@ impl StateDB {
             code: Vec::new(),
             storage: BTreeMap::new(),
         });
-
         acc.immature_rewards.push((block_height, reward));
-
         self.update_account(miner, &acc)?;
         Ok(())
     }
@@ -493,96 +218,6 @@ impl StateDB {
     pub fn flush(&mut self) -> Result<(), String> {
         let path = crate::datadir::chainstate_dir().join("root_hash.txt");
         let _ = std::fs::write(path, hex::encode(self.cached_root));
-
         self.adapter.flush().map_err(|e| e.to_string())
-    }
-}
-
-impl std::fmt::Debug for StateDB {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StateDB").finish()
-    }
-}
-
-fn empty_account() -> Account {
-    Account {
-        nonce: 0,
-        balance: 0,
-        immature_rewards: Vec::new(),
-        code: Vec::new(),
-        storage: BTreeMap::new(),
-    }
-}
-
-fn read_account_from_trie<D: DB>(
-    trie: &mut EthTrie<D>,
-    key: &[u8; 32],
-) -> Result<Option<Account>, String> {
-    match trie.get(key).map_err(|e| format!("trie read failed: {}", e))? {
-        Some(value) => {
-            let account: Account =
-                rlp::decode(&value).map_err(|e| format!("RLP decode error: {}", e))?;
-            Ok(Some(account))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Apply a block reward to the miner account in the given trie.
-fn credit_reward_on_trie<D: DB>(
-    trie: &mut EthTrie<D>,
-    miner: &str,
-    reward: u64,
-    block_height: u64,
-    _maturity: u64,
-) -> Result<(), String> {
-    let key = keccak(miner.as_bytes()).0;
-    let mut acc = read_account_from_trie(trie, &key)?.unwrap_or_else(empty_account);
-
-    acc.immature_rewards.push((block_height, reward));
-
-    let value = rlp::encode(&acc).to_vec();
-    trie.insert(&key, &value)
-        .map_err(|e| format!("failed to credit reward in simulation: {}", e))?;
-    Ok(())
-}
-
-// A minimal in-memory DB implementation used by `simulate_apply` so that
-// the simulation never writes to the persistent LevelDB.
-#[derive(Clone, Default)]
-struct MemoryDb {
-    inner: Arc<Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
-}
-
-impl MemoryDb {
-    fn new() -> Self {
-        MemoryDb {
-            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-}
-
-impl DB for MemoryDb {
-    type Error = std::io::Error;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        let guard = self.inner.lock().unwrap();
-        Ok(guard.get(key).cloned())
-    }
-
-    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.insert(key.to_vec(), value);
-        Ok(())
-    }
-
-    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(key);
-        Ok(())
-    }
-
-    fn flush(&self) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
