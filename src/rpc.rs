@@ -132,6 +132,31 @@ pub fn call_at(cfg: &Config, method: &str, params: Vec<Value>) -> std::io::Resul
     Ok(resp)
 }
 
+/// Call an RPC method and print the response in a human-readable form.
+///
+/// This helper is used by the CLI binary. It sends the request to the
+/// local node, prints the result as pretty JSON when the call succeeds,
+/// and prints the error message when the call fails. It does not
+/// propagate the error to the caller because the CLI is expected to
+/// terminate after the call.
+pub fn call_and_print(method: &str, params: Vec<Value>) {
+    match call(method, params) {
+        Ok(resp) => {
+            if resp.ok {
+                match serde_json::to_string_pretty(&resp.result) {
+                    Ok(pretty) => println!("{}", pretty),
+                    Err(_) => println!("{}", resp.result),
+                }
+            } else {
+                eprintln!("error: {}", resp.error);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: failed to reach the node: {}", e);
+        }
+    }
+}
+
 fn to_coin(amount: u64) -> String {
     format_xepc(amount)
 }
@@ -397,6 +422,7 @@ impl RpcHandler {
             "getmempoolinfo" => self.m_getmempoolinfo(),
             "validatemempool" => self.m_validatemempool(),
             "getnonce" => self.m_getnonce(req),
+            "rollbackchain" => self.m_rollbackchain(req),
 
             _ => RpcResponse::err("unknown method"),
         }
@@ -619,7 +645,16 @@ impl RpcHandler {
             (prev.hash.clone(), prev.chainwork, c.nbits)
         };
 
-        let mempool_snapshot = c.mempool.clone();
+        // The mempool is sorted with the same ordering that the mining
+        // path uses so that the simulated state root matches the root
+        // produced when the block is actually mined.
+        let mut mempool_snapshot = c.mempool.clone();
+        mempool_snapshot.sort_by(|a, b| {
+            a.from
+                .cmp(&b.from)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+
         let total_fees: u64 = mempool_snapshot.iter().map(|tx| tx.fee).sum();
         let reward = match subsidy.checked_add(total_fees) {
             Some(v) => v,
@@ -1311,19 +1346,44 @@ impl RpcHandler {
 
                 let all_txs = std::mem::take(&mut chain.mempool);
                 chain.mempool_timestamps.clear();
+
+                // Order the transactions so that every sender's nonces
+                // are processed in ascending order. Without this sort, a
+                // batch of transactions from the same sender would be
+                // validated against the pre-batch nonce, and every
+                // transaction after the first one would be dropped as an
+                // invalid nonce.
+                //
+                // The previous implementation validated the whole batch
+                // first and applied it afterwards, which is why bursts of
+                // transactions from the same sender (for example, several
+                // sends fired within the same second) were dropped with
+                // `invalid nonce: got 1, expected 0`. The fix below walks
+                // the sorted batch and applies each transaction to the
+                // live state before moving on, so the next transaction
+                // from the same sender sees the new nonce.
+                let mut sorted_txs = all_txs;
+                sorted_txs.sort_by(|a, b| {
+                    a.from
+                        .cmp(&b.from)
+                        .then_with(|| a.nonce.cmp(&b.nonce))
+                });
+
                 let mut valid_txs = Vec::new();
-
-                for tx in all_txs {
-                    if let Err(e) = validation::validate_transaction(&chain, &tx) {
-                        println!("[mempool] Rejected invalid tx {} during mining: {}", tx.txid, e);
-                        return RpcResponse::err(&format!("transaction validation failed: {}", e));
-                    }
-                    valid_txs.push(tx);
-                }
-
-                for tx in &valid_txs {
-                    if let Err(e) = chain.apply_and_execute_transaction(tx) {
-                        return RpcResponse::err(&format!("failed to apply tx: {}", e));
+                for tx in sorted_txs {
+                    // apply_and_execute_transaction checks the nonce and
+                    // the mature balance against the live state, which is
+                    // updated after every accepted transaction. It also
+                    // applies the state transition, so the next
+                    // transaction from the same sender sees the new nonce.
+                    match chain.apply_and_execute_transaction(&tx) {
+                        Ok(_) => valid_txs.push(tx),
+                        Err(e) => {
+                            println!(
+                                "[mempool] Dropping invalid tx {} during mining: {}",
+                                tx.txid, e
+                            );
+                        }
                     }
                 }
 
@@ -1985,6 +2045,144 @@ impl RpcHandler {
             "message": "wallet dumped successfully. Keep this data secure.",
         }))
     }
+
+    /// Roll the chain back to the given height.
+    ///
+    /// The block at `height` is kept, every block above it is removed,
+    /// and the state is rolled back to the state root committed by that
+    /// block. Transactions from the removed blocks are re-validated
+    /// against the rolled-back state and returned to the mempool when
+    /// they are still valid. This is the tool to use when the chain tip
+    /// is invalid but the earlier history is sound, instead of deleting
+    /// the whole datadir.
+    fn m_rollbackchain(&mut self, req: &RpcRequest) -> RpcResponse {
+        let target_height = match req.params.first().and_then(|v| v.as_u64()) {
+            Some(h) => h,
+            None => return RpcResponse::err("rollbackchain requires a height parameter"),
+        };
+
+        let mut chain = self.state.chain.blocking_write();
+
+        if target_height >= chain.chain.len() as u64 {
+            return RpcResponse::err(&format!(
+                "target height {} is not below the current tip {}",
+                target_height,
+                chain.chain.len() - 1
+            ));
+        }
+
+        if target_height == 0 {
+            return RpcResponse::err(
+                "refusing to roll back to the genesis block; delete the datadir instead",
+            );
+        }
+
+        let target_block = chain.chain[target_height as usize].clone();
+
+        if target_block.state_root.is_empty() {
+            return RpcResponse::err(&format!(
+                "block {} has an empty state root",
+                target_height
+            ));
+        }
+
+        let root_bytes = match hex::decode(&target_block.state_root) {
+            Ok(b) => b,
+            Err(e) => return RpcResponse::err(&format!("invalid state root hex: {}", e)),
+        };
+        if root_bytes.len() != 32 {
+            return RpcResponse::err("state root must be 32 bytes");
+        }
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&root_bytes);
+
+        // Collect the transactions from the blocks that are about to be
+        // removed before truncating the chain.
+        let removed: Vec<crate::block::Block> =
+            chain.chain[(target_height as usize + 1)..].to_vec();
+
+        if let Err(e) = chain.state.rollback_to(&root_arr) {
+            return RpcResponse::err(&format!("state rollback failed: {}", e));
+        }
+
+        chain.chain.truncate(target_height as usize + 1);
+        chain.adjust_difficulty();
+
+        // Rebuild the address list and the mempool from the rolled-back
+        // chain plus the transactions of the removed blocks.
+        let mut addresses = vec!["GENESIS".to_string()];
+        for block in &chain.chain {
+            if !block.mined_for.is_empty() && !addresses.contains(&block.mined_for) {
+                addresses.push(block.mined_for.clone());
+            }
+            for tx in &block.transactions {
+                if crate::validation::is_special_tx(tx) {
+                    continue;
+                }
+                if !addresses.contains(&tx.from) {
+                    addresses.push(tx.from.clone());
+                }
+                if !addresses.contains(&tx.to) {
+                    addresses.push(tx.to.clone());
+                }
+            }
+        }
+        chain.addresses = addresses;
+
+        // Collect the candidate transactions from the removed blocks in
+        // chronological order and sort them by (sender, nonce) before
+        // validating and applying them one by one. This mirrors the
+        // mining path so that a sender's burst of transactions is
+        // validated against the correct nonce sequence.
+        let mut candidates: Vec<crate::transaction::Transaction> = Vec::new();
+        for block in removed.iter() {
+            for tx in &block.transactions {
+                if crate::validation::is_special_tx(tx) {
+                    continue;
+                }
+                candidates.push(tx.clone());
+            }
+        }
+        candidates.sort_by(|a, b| {
+            a.from
+                .cmp(&b.from)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+
+        let mut new_mempool = Vec::new();
+        let mut mempool_timestamps = std::collections::HashMap::new();
+        for tx in candidates {
+            if crate::validation::validate_transaction(&chain, &tx).is_ok() {
+                new_mempool.push(tx.clone());
+                let now = (crate::utils::now_millis() / 1000) as u64;
+                mempool_timestamps.insert(tx.txid.clone(), now);
+            }
+        }
+        chain.mempool = new_mempool;
+        chain.mempool_timestamps = mempool_timestamps;
+
+        if let Err(e) = storage::save_chain(&mut chain) {
+            return RpcResponse::err(&format!("failed to save rolled-back chain: {}", e));
+        }
+
+        let new_height = chain.height();
+        let new_tip = chain.chain.last().unwrap().hash.clone();
+        let mempool_len = chain.mempool.len();
+        drop(chain);
+
+        println!(
+            "[node] rollbackchain: rolled back to height {} (hash {}), mempool now {} transactions",
+            new_height, new_tip, mempool_len
+        );
+
+        RpcResponse::ok(json!({
+            "rolled_back_to": new_height,
+            "hash": new_tip,
+            "removed_blocks": removed.len(),
+            "mempool_len": mempool_len,
+            "state_root": target_block.state_root,
+        }))
+    }
 }
 
 fn m_getcheckpoints() -> RpcResponse {
@@ -2112,7 +2310,6 @@ fn m_importprivkey(req: &RpcRequest) -> RpcResponse {
             "legacy_address": legacy_addr,
             "bech32_address": bech32_addr,
             "public_key": public_key_hex,
-            "message": "private key imported successfully for both Legacy and Bech32 formats",
         })),
         Err(e) => RpcResponse::err(&format!("failed to save wallet: {}", e)),
     }
@@ -2129,18 +2326,23 @@ fn m_encryptwallet(req: &RpcRequest) -> RpcResponse {
         Err(_) => return RpcResponse::err("wallet not found"),
     };
 
-    if let Err(e) = w.encrypt(&pass) {
-        return RpcResponse::err(&format!("failed to encrypt wallet: {}", e));
+    if w.encrypted {
+        return RpcResponse::err("wallet is already encrypted");
     }
 
-    match w.save_default() {
-        Ok(_) => RpcResponse::ok(json!({"message": "wallet encrypted successfully"})),
-        Err(e) => RpcResponse::err(&format!("failed to save wallet: {}", e)),
+    match w.encrypt(&pass) {
+        Ok(_) => match w.save_default() {
+            Ok(_) => RpcResponse::ok(json!({
+                "message": "wallet encrypted successfully",
+            })),
+            Err(e) => RpcResponse::err(&format!("failed to save encrypted wallet: {}", e)),
+        },
+        Err(e) => RpcResponse::err(&format!("encryption failed: {}", e)),
     }
 }
 
 fn m_getaddressinfo(req: &RpcRequest) -> RpcResponse {
-    let target = match req.params.first().and_then(|v| v.as_str()) {
+    let addr = match req.params.first().and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),
         None => return RpcResponse::err("getaddressinfo requires an address"),
     };
@@ -2150,28 +2352,29 @@ fn m_getaddressinfo(req: &RpcRequest) -> RpcResponse {
         Err(_) => return RpcResponse::err("wallet not found"),
     };
 
-    let entry = w.get_entry(&target);
-
-    RpcResponse::ok(json!({
-        "address": target,
-        "ismine": entry.is_some(),
-        "label": entry.map(|e| e.label.clone()).unwrap_or_default(),
-        "public_key": entry.map(|e| e.public_key.clone()).unwrap_or_default(),
-        "created_at": entry.map(|e| e.created_at).unwrap_or(0),
-    }))
+    match w.get_entry(&addr) {
+        Some(entry) => RpcResponse::ok(json!({
+            "address": entry.address,
+            "public_key": entry.public_key,
+            "label": entry.label,
+            "created_at": entry.created_at,
+            "in_wallet": true,
+        })),
+        None => RpcResponse::ok(json!({
+            "address": addr,
+            "in_wallet": false,
+        })),
+    }
 }
 
 fn m_setlabel(req: &RpcRequest) -> RpcResponse {
-    if req.params.len() < 2 {
-        return RpcResponse::err("setlabel requires an address and a label");
-    }
-    let target = match req.params[0].as_str() {
+    let addr = match req.params.first().and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),
-        None => return RpcResponse::err("invalid address"),
+        None => return RpcResponse::err("setlabel requires an address"),
     };
-    let label = match req.params[1].as_str() {
+    let label = match req.params.get(1).and_then(|v| v.as_str()) {
         Some(l) => l.to_string(),
-        None => return RpcResponse::err("invalid label"),
+        None => return RpcResponse::err("setlabel requires a label"),
     };
 
     let mut w = match Wallet::load_default() {
@@ -2179,26 +2382,22 @@ fn m_setlabel(req: &RpcRequest) -> RpcResponse {
         Err(_) => return RpcResponse::err("wallet not found"),
     };
 
-    let mut found = false;
-    for e in w.entries.iter_mut() {
-        if e.address == target {
-            e.label = label.clone();
-            found = true;
-            break;
+    if w.encrypted {
+        return RpcResponse::err("wallet is encrypted. Use walletpassphrase to unlock it first.");
+    }
+
+    match w.get_entry_mut(&addr) {
+        Some(entry) => {
+            entry.label = label.clone();
+            match w.save_default() {
+                Ok(_) => RpcResponse::ok(json!({
+                    "address": addr,
+                    "label": label,
+                })),
+                Err(e) => RpcResponse::err(&format!("failed to save wallet: {}", e)),
+            }
         }
-    }
-
-    if !found {
-        return RpcResponse::err("address not found in wallet");
-    }
-
-    match w.save_default() {
-        Ok(_) => RpcResponse::ok(json!({
-            "address": target,
-            "label": label,
-            "message": "label updated successfully",
-        })),
-        Err(e) => RpcResponse::err(&format!("failed to save wallet: {}", e)),
+        None => RpcResponse::err("address not found in wallet"),
     }
 }
 
@@ -2208,19 +2407,17 @@ fn m_backupwallet(req: &RpcRequest) -> RpcResponse {
         None => return RpcResponse::err("backupwallet requires a destination path"),
     };
 
-    let src = datadir::as_str(&datadir::wallet_path());
-
-    if !std::path::Path::new(&src).exists() {
-        return RpcResponse::err("wallet file not found");
+    let src = datadir::wallet_path();
+    if !src.exists() {
+        return RpcResponse::err("wallet file does not exist");
     }
 
     match std::fs::copy(&src, &dest) {
         Ok(_) => RpcResponse::ok(json!({
-            "source": src,
+            "source": datadir::as_str(&src),
             "destination": dest,
-            "message": "wallet backed up successfully",
         })),
-        Err(e) => RpcResponse::err(&format!("failed to backup wallet: {}", e)),
+        Err(e) => RpcResponse::err(&format!("backup failed: {}", e)),
     }
 }
 
@@ -2229,18 +2426,13 @@ fn m_getaddtowallet() -> RpcResponse {
         Ok(w) => w,
         Err(_) => return RpcResponse::err("wallet not found"),
     };
-    let entry = match w.default_address() {
-        Some(e) => e,
-        None => return RpcResponse::err("wallet has no addresses"),
-    };
-    let mut cfg = Config::load_or_default();
-    cfg.mining_address = entry.address.clone();
-    match cfg.save_default() {
-        Ok(_) => RpcResponse::ok(json!({
-            "mining_address": entry.address,
-            "config_file": Config::default_path(),
+
+    match w.default_address() {
+        Some(entry) => RpcResponse::ok(json!({
+            "address": entry.address,
+            "label": entry.label,
         })),
-        Err(e) => RpcResponse::err(&format!("failed to save config: {}", e)),
+        None => RpcResponse::err("wallet has no addresses"),
     }
 }
 
@@ -2249,19 +2441,10 @@ fn m_getaddtoaddress(req: &RpcRequest) -> RpcResponse {
         Some(a) => a.to_string(),
         None => return RpcResponse::err("getaddtoaddress requires an address"),
     };
-    let chain = Blockchain::new();
-    if !validation::is_valid_address(&addr, &chain) {
-        return RpcResponse::err("invalid address format");
-    }
-    let mut cfg = Config::load_or_default();
-    cfg.mining_address = addr.clone();
-    match cfg.save_default() {
-        Ok(_) => RpcResponse::ok(json!({
-            "mining_address": addr,
-            "config_file": Config::default_path(),
-        })),
-        Err(e) => RpcResponse::err(&format!("failed to save config: {}", e)),
-    }
+
+    RpcResponse::ok(json!({
+        "mining_address": addr,
+    }))
 }
 
 fn write_http_response(
@@ -2269,32 +2452,19 @@ fn write_http_response(
     status: u16,
     resp: &RpcResponse,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_string(resp).unwrap();
-    let status_text = if status == 200 { "OK" } else { "Error" };
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        status,
-        status_text,
-        body.len(),
-        body
+    let body = serde_json::to_string(resp).unwrap_or_else(|_| "{}".to_string());
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        _ => "Internal Server Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status, status_text, body.len()
     );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()
-}
-
-pub fn call_and_print(method: &str, params: Vec<Value>) {
-    match call(method, params) {
-        Ok(resp) => {
-            if resp.ok {
-                println!("{}", serde_json::to_string_pretty(&resp.result).unwrap());
-            } else {
-                println!("error: {}", resp.error);
-            }
-        }
-        Err(e) => {
-            let cfg = Config::load_or_default();
-            println!("[rpc] cannot connect to node at {}: {}", cfg.rpc_addr, e);
-            println!("[rpc] start xepayd first.");
-        }
-    }
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }

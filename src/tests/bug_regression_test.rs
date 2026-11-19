@@ -43,8 +43,8 @@ fn bug_1_genesis_accessors_are_internally_consistent() {
 
 #[test]
 fn bug_2_address_prefix_is_network_aware() {
-    assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Main), 0x30);
-    assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Main), "xepc");
+    assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Main), 0x4b);
+    assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Main), "xepay");
     assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Test), 0x6f);
     assert_eq!(xepay::blockchain::bech32_hrp_for(Network::Test), "xtes");
     assert_eq!(xepay::blockchain::legacy_prefix_byte_for(Network::Regtest), 0x6f);

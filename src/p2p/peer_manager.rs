@@ -145,6 +145,15 @@ impl PeerManager {
         }
     }
 
+    /// Remove a peer without pushing a `Disconnected` event.
+    ///
+    /// This is used by the connection cleanup path, which already handles
+    /// the disconnection logic and does not want to push another event
+    /// that would cause the cleanup to run twice.
+    pub fn remove_silent(&mut self, id: u64) {
+        self.peers.remove(&id);
+    }
+
     /// Ban a peer: mark it banned, add its address to the ban list,
     /// and remove it from the active set.
     pub fn ban(&mut self, id: u64, reason: &str) {

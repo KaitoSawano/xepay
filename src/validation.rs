@@ -610,7 +610,13 @@ pub fn rule_genesis_pow(block: &Block) -> Result<(), ValidationError> {
 }
 
 pub fn is_special_tx(tx: &Transaction) -> bool {
-    tx.from == "COINBASE" || tx.from == "GENESIS" || tx.from == "NETWORK" || tx.from == "MEMPOOL"
+    // Only the two synthetic transactions embedded in the genesis block
+    // are special. The previous implementation also treated the strings
+    // "NETWORK" and "MEMPOOL" as special, which let a transaction with
+    // `from = "NETWORK"` bypass every validation rule and skip the state
+    // transition entirely. That is a consensus hole, so those two
+    // markers have been removed.
+    tx.from == "COINBASE" || tx.from == "GENESIS"
 }
 
 pub fn is_valid_address(addr: &str, chain: &Blockchain) -> bool {
@@ -651,8 +657,17 @@ pub fn validate_block_transactions(
             continue;
         }
 
+        // Structural checks that do not depend on the chain state.
+        rule_txid_consistent(tx)?;
+        rule_address_format(&tx.from, chain)?;
+        rule_address_format(&tx.to, chain)?;
         rule_self_send(tx)?;
+        rule_message_format(tx)?;
+        rule_amount_nonzero(tx)?;
         rule_money_range(tx)?;
+        rule_note_length(tx)?;
+        rule_signature(tx)?;
+        rule_address_matches_pubkey(tx)?;
 
         let base_nonce = overlay_nonces
             .get(&tx.from)
@@ -782,12 +797,26 @@ pub fn validate_block(
     Ok(())
 }
 
+/// Validate the structural integrity of the stored chain.
+///
+/// This check verifies everything that can be verified from the block
+/// data alone: the genesis block, the block hash, the merkle root, the
+/// proof of work, the reward schedule, the chainwork, and the block
+/// headers. It deliberately does NOT replay transactions, because the
+/// live state reflects the tip of the chain and cannot be used to
+/// validate historical nonce and balance checks. Replaying the
+/// transactions is the job of the reindex path, which rebuilds the
+/// state from genesis and fails on the first invalid transaction.
+///
+/// This mirrors the reference node's behaviour: `verifychain` checks
+/// the chain structure, while a reindex performs the full state
+/// transition.
 pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
     if chain.chain.is_empty() {
         return Err(ValidationError::new("E040", "chain is empty"));
     }
 
-    let (genesis_txs, genesis_index) = {
+    {
         let genesis = &chain.chain[0];
         rule_genesis(genesis)?;
         rule_genesis_fingerprint(genesis)?;
@@ -796,13 +825,8 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
         rule_block_hash_consistent(genesis)?;
         rule_block_merkle_root(genesis)?;
         rule_block_version(genesis)?;
-        (genesis.transactions.clone(), genesis.index)
-    };
-    rule_total_supply(chain)?;
-
-    if !genesis_txs.is_empty() {
-        validate_block_transactions(chain, &genesis_txs, genesis_index)?;
     }
+    rule_total_supply(chain)?;
 
     for i in 1..chain.chain.len() {
         let (prev_hash, prev_index, prev_timestamp, prev_chainwork) = {
@@ -810,11 +834,9 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
             (prev.hash.clone(), prev.index, prev.timestamp, prev.chainwork)
         };
         let (
-            _cur_hash,
             cur_index,
             cur_nversion,
             cur_previous_hash,
-            _cur_merkle_root,
             cur_subsidy,
             cur_total_fees,
             cur_reward,
@@ -824,15 +846,12 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
             cur_timestamp,
             cur_tx_count,
             cur_chainwork,
-            cur_transactions,
         ) = {
             let cur = &chain.chain[i];
             (
-                cur.hash.clone(),
                 cur.index,
                 cur.nversion,
                 cur.previous_hash.clone(),
-                cur.merkle_root.clone(),
                 cur.subsidy,
                 cur.total_fees,
                 cur.reward,
@@ -842,7 +861,6 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
                 cur.timestamp,
                 cur.transactions.len(),
                 cur.chainwork,
-                cur.transactions.clone(),
             )
         };
 
@@ -936,8 +954,6 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
             return Err(ValidationError::new("E051",
                 format!("chainwork of block {} is invalid: got {}, expected {}", cur_index, cur_chainwork, expected_chainwork)));
         }
-
-        validate_block_transactions(chain, &cur_transactions, cur_index)?;
     }
 
     Ok(())

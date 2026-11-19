@@ -12,7 +12,12 @@ use std::collections::BTreeMap;
 pub struct Account {
     pub nonce: u64,
     pub balance: u64,
-    pub immature_rewards: Vec<(u64, u64)>,
+    /// Immature rewards keyed by the height at which they were credited.
+    /// A `BTreeMap` is used instead of a `Vec` so that the RLP encoding is
+    /// deterministic regardless of the order in which rewards were
+    /// credited, settled, or replayed. Two nodes that hold the same set of
+    /// (height, amount) pairs therefore always produce the same state root.
+    pub immature_rewards: BTreeMap<u64, u64>,
     pub code: Vec<u8>,
     // Changed from HashMap to BTreeMap for deterministic RLP encoding.
     pub storage: BTreeMap<[u8; 32], [u8; 32]>,
@@ -23,6 +28,9 @@ impl Encodable for Account {
         s.begin_list(5);
         s.append(&self.nonce);
         s.append(&self.balance);
+        // The immature rewards are encoded as a list of (height, amount)
+        // pairs in ascending height order because the backing container is
+        // a `BTreeMap`. This keeps the encoding stable across runs.
         s.begin_list(self.immature_rewards.len());
         for (height, amount) in &self.immature_rewards {
             s.begin_list(2);
@@ -44,12 +52,16 @@ impl Decodable for Account {
         let nonce: u64 = rlp.val_at(0)?;
         let balance: u64 = rlp.val_at(1)?;
         let immature_list = rlp.at(2)?;
-        let mut immature_rewards = Vec::new();
+        let mut immature_rewards = BTreeMap::new();
         for i in 0..immature_list.item_count()? {
             let item = immature_list.at(i)?;
             let height: u64 = item.val_at(0)?;
             let amount: u64 = item.val_at(1)?;
-            immature_rewards.push((height, amount));
+            // If two entries share the same height, the amounts are summed
+            // so that the decoded account is independent of the order in
+            // which the duplicates appeared on the wire.
+            let entry = immature_rewards.entry(height).or_insert(0u64);
+            *entry = entry.saturating_add(amount);
         }
         let code: Vec<u8> = rlp.val_at(3)?;
         let storage_list = rlp.at(4)?;

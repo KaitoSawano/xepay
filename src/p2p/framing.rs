@@ -152,4 +152,30 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_message(&mut cursor).is_err());
     }
+
+    #[test]
+    fn all_commands_fit_in_header() {
+        use crate::p2p::message::Message;
+        let commands = [
+            Message::Verack.command(),
+            Message::GetAddr.command(),
+            Message::Ping(0).command(),
+            Message::Pong(0).command(),
+            Message::Reject {
+                command: String::new(),
+                code: 0,
+                reason: String::new(),
+            }
+            .command(),
+        ];
+        for cmd in commands {
+            assert!(
+                cmd.len() <= COMMAND_LEN,
+                "command '{}' ({} chars) exceeds COMMAND_LEN ({})",
+                cmd,
+                cmd.len(),
+                COMMAND_LEN
+            );
+        }
+    }
 }

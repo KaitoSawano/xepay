@@ -25,8 +25,7 @@ use crate::p2p::inv::InventoryManager;
 use crate::p2p::message::{BlockLocator, InvType, Inventory, Message};
 use crate::p2p::peer::{ConnectionType, PeerState};
 use crate::p2p::peer_manager::{PeerEvent, PeerManager};
-use crate::p2p::peers;
-use crate::p2p::sync::SyncState;
+use crate::p2p::sync::{SyncState, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS};
 use crate::storage;
 use crate::utils::{format_datetime, now_millis};
 use crate::validation;
@@ -38,6 +37,14 @@ const MAX_TX_PER_SECOND: u32 = 50;
 const MAX_INV_PER_SECOND: u32 = 100;
 const MAX_HEADERS_PER_SECOND: u32 = 20;
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
+
+/// Base timeout before considering a block download peer unresponsive.
+/// This mirrors the reference node's BLOCK_STALLING_TIMEOUT of 2 seconds.
+const BASE_BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum stalling timeout after repeated stalling disconnects.
+/// This mirrors the reference node's adaptive cap of 64 seconds.
+const MAX_BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(64);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerInfo {
@@ -120,6 +127,10 @@ pub struct Network {
     anchors: Vec<Anchor>,
     block_relay_peers: Vec<SocketAddr>,
     sync_state: SyncState,
+    header_chain: Vec<Block>,
+    /// Adaptive stalling timeout. Doubled on each stalling disconnect,
+    /// halved back to the base value whenever a block is accepted.
+    stalling_timeout: Duration,
 }
 
 impl Network {
@@ -173,6 +184,8 @@ impl Network {
             anchors,
             block_relay_peers: Vec::new(),
             sync_state: SyncState::new(),
+            header_chain: Vec::new(),
+            stalling_timeout: BASE_BLOCK_STALLING_TIMEOUT,
         }
     }
 
@@ -329,6 +342,126 @@ impl Network {
         self.peer_manager.tick();
         self.addr_book.prune(Duration::from_secs(3600));
         self.sync_state.expire_requests();
+
+        let stalling_peers = self
+            .sync_state
+            .check_stalling_peers(self.stalling_timeout);
+        for peer_id in stalling_peers {
+            // Do not disconnect a stalling peer. The peer may be slow, or
+            // it may need to fetch the requested blocks itself before it
+            // can serve them. Dropping the in-flight requests keeps the
+            // connection open and lets the peer announce blocks later
+            // through a fresh `inv` message.
+            println!(
+                "[p2p] peer {} is stalling; dropping in-flight block requests but keeping the connection",
+                peer_id
+            );
+            self.sync_state.give_up_on_stalling_peer(peer_id);
+        }
+
+        self.request_blocks_from_peers().await;
+
+        // Flush any messages queued during block requests.
+        // The main loop only flushes a connection after it has read data,
+        // so messages queued from a timer tick would otherwise sit in the
+        // write buffer until the peer sends something.
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            self.flush_write(id).await;
+        }
+    }
+
+    /// Request blocks from all available peers based on the current download window.
+    ///
+    /// The block hash is taken from the local header chain, not from the
+    /// applied chain. The applied chain does not contain the blocks that
+    /// are still being downloaded, so looking them up there would return
+    /// nothing and synchronization would stall.
+    async fn request_blocks_from_peers(&mut self) {
+        let chain = self.chain.read().await;
+        let (window_start, window_end) = self.sync_state.download_window(&chain);
+        let current_height = chain.height();
+        drop(chain);
+
+        if window_start >= window_end {
+            return;
+        }
+
+        let connected_peers: Vec<u64> = self
+            .peer_manager
+            .all_peers()
+            .iter()
+            .filter(|p| p.is_connected() && p.conn_type != ConnectionType::OutboundBlockRelayOnly)
+            .filter(|p| self.connections.contains_key(&p.id))
+            .map(|p| p.id)
+            .collect();
+
+        if connected_peers.is_empty() {
+            return;
+        }
+
+        let mut requests: HashMap<u64, Vec<Inventory>> = HashMap::new();
+
+        for peer_id in &connected_peers {
+            self.sync_state.register_peer(*peer_id);
+
+            let peer_state = match self.sync_state.peer_states.get(peer_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if !peer_state.can_request() {
+                continue;
+            }
+
+            let available_slots = MAX_BLOCKS_IN_TRANSIT_PER_PEER - peer_state.in_flight.len();
+            let mut peer_requests = Vec::new();
+
+            for height in window_start..window_end {
+                if peer_requests.len() >= available_slots {
+                    break;
+                }
+
+                if height <= current_height {
+                    continue;
+                }
+
+                let header = match self.header_at_height(height) {
+                    Some(h) => h,
+                    None => continue,
+                };
+
+                if self.sync_state.blocks_requested.contains(&header.hash) {
+                    continue;
+                }
+
+                if self.sync_state.blocks_received.contains(&header.hash) {
+                    continue;
+                }
+
+                if self.sync_state.request_block(*peer_id, &header.hash) {
+                    peer_requests.push(Inventory {
+                        inv_type: InvType::Block,
+                        hash: header.hash.clone(),
+                    });
+                }
+            }
+
+            if !peer_requests.is_empty() {
+                requests.insert(*peer_id, peer_requests);
+            }
+        }
+
+        for (peer_id, items) in requests {
+            self.queue_message(peer_id, &Message::GetData(items));
+        }
+    }
+
+    fn header_at_height(&self, height: u64) -> Option<Block> {
+        self.header_chain
+            .iter()
+            .find(|b| b.index == height)
+            .cloned()
     }
 
     async fn try_connect(&mut self) {
@@ -344,6 +477,10 @@ impl Network {
         }
 
         if self.peer_manager.can_add_outbound_full_relay() {
+            let candidates = self.addr_book.candidates(Duration::from_secs(60), 10);
+            if candidates.is_empty() && self.peer_manager.connected_peers().is_empty() {
+                self.addr_book.reset_all_failures();
+            }
             if let Some(addr) = self
                 .addr_book
                 .candidates(Duration::from_secs(60), 10)
@@ -450,6 +587,19 @@ impl Network {
     ) {
         if self.banman.is_banned(&addr) {
             return;
+        }
+        // Skip if we already have a peer for this address in any state
+        // other than Disconnected or Banned. This mirrors the reference
+        // node's rule that outbound connections never target an address
+        // that is already connected, regardless of the handshake state.
+        for peer in self.peer_manager.all_peers() {
+            if peer.addr == addr
+                && peer.state != PeerState::Disconnected
+                && peer.state != PeerState::Banned
+                && peer.conn_type != ConnectionType::Inbound
+            {
+                return;
+            }
         }
         if let Some(local) = self.local_addr {
             if local.ip().is_unspecified() {
@@ -570,12 +720,12 @@ impl Network {
         self.queue_message(id, &msg);
     }
 
-    fn queue_message(&mut self, id: u64, msg: &Message) {
+    fn queue_message(&mut self, id: u64, msg: &Message) -> bool {
         let payload = msg.serialize();
         let cmd = msg.command();
         let mut buf = Vec::new();
         if write_message(&mut buf, cmd, &payload).is_err() {
-            return;
+            return false;
         }
         if let Some(conn) = self.connections.get_mut(&id) {
             if conn.write_buf.len() + buf.len() > MAX_WRITE_BUFFER {
@@ -585,10 +735,12 @@ impl Network {
                 );
                 conn.write_buf.clear();
                 conn.read_buf.clear();
-                return;
+                return false;
             }
             conn.write_buf.extend_from_slice(&buf);
+            return true;
         }
+        false
     }
 
     async fn process_connections(&mut self) {
@@ -810,15 +962,16 @@ impl Network {
                 if new_items.is_empty() {
                     return;
                 }
-                let mut to_request = Vec::new();
+
                 let chain = self.chain.read().await;
+                let mut to_request = Vec::new();
                 for inv in &new_items {
                     if inv.inv_type == InvType::Block {
                         if chain.chain.iter().any(|b| b.hash == inv.hash) {
                             self.inv.add_block(&inv.hash);
                             continue;
                         }
-                        if self.sync_state.request_block(&inv.hash) {
+                        if self.sync_state.request_block(id, &inv.hash) {
                             to_request.push(inv.clone());
                         }
                     } else if inv.inv_type == InvType::Transaction && !self.inv.has_tx(&inv.hash) {
@@ -845,6 +998,7 @@ impl Network {
             Message::GetData(items) => {
                 let chain = self.chain.read().await;
                 let mut to_send: Vec<Message> = Vec::new();
+                let mut not_found: Vec<Inventory> = Vec::new();
                 for inv in items {
                     match inv.inv_type {
                         InvType::Block => {
@@ -852,6 +1006,8 @@ impl Network {
                                 chain.chain.iter().find(|b| b.hash == inv.hash).cloned()
                             {
                                 to_send.push(Message::Block(b));
+                            } else {
+                                not_found.push(inv.clone());
                             }
                         }
                         InvType::Transaction => {
@@ -859,6 +1015,8 @@ impl Network {
                                 chain.mempool.iter().find(|t| t.txid == inv.hash).cloned()
                             {
                                 to_send.push(Message::Tx(tx));
+                            } else {
+                                not_found.push(inv.clone());
                             }
                         }
                     }
@@ -866,6 +1024,25 @@ impl Network {
                 drop(chain);
                 for msg in to_send {
                     self.queue_message(id, &msg);
+                }
+                if !not_found.is_empty() {
+                    self.queue_message(id, &Message::NotFound(not_found));
+                }
+            }
+            Message::NotFound(items) => {
+                for inv in items {
+                    self.sync_state.remove_in_flight(id, &inv.hash);
+                    // Remember the hash so that the same missing item is
+                    // not requested again from this peer in the same
+                    // session.
+                    match inv.inv_type {
+                        InvType::Block => {
+                            self.inv.add_block(&inv.hash);
+                        }
+                        InvType::Transaction => {
+                            self.inv.add_tx(&inv.hash);
+                        }
+                    }
                 }
             }
             Message::GetHeaders(loc) => {
@@ -969,7 +1146,7 @@ impl Network {
             return;
         }
 
-        if headers.len() > peers::HEADERS_PER_REQUEST as usize {
+        if headers.len() > MAX_HEADERS_RESULTS as usize {
             self.punish(id, 20, "too many headers in one message").await;
             return;
         }
@@ -987,87 +1164,117 @@ impl Network {
                 .await;
             return;
         }
-
-        for window in headers.windows(2) {
-            if window[1].index != window[0].index + 1 || window[1].previous_hash != window[0].hash {
-                drop(chain);
-                self.punish(id, 20, "headers are not sequential").await;
-                return;
-            }
-        }
-
-        let tip_index = chain.chain.last().map(|b| b.index).unwrap_or(0);
-        let mut to_request = Vec::new();
-        for h in &headers {
-            if let Err(e) = validation::rule_block_pow(h) {
-                drop(chain);
-                self.punish(id, 50, &format!("invalid header PoW: {}", e)).await;
-                return;
-            }
-            if let Err(e) = validation::rule_block_nbits(&chain, h) {
-                drop(chain);
-                self.punish(id, 50, &format!("invalid header nbits: {}", e)).await;
-                return;
-            }
-            if h.timestamp > crate::utils::now_millis().saturating_add(2 * 60 * 60 * 1000) {
-                drop(chain);
-                self.punish(id, 50, "header timestamp too far in the future").await;
-                return;
-            }
-
-            if h.index > tip_index && !self.inv.has_block(&h.hash) {
-                if self.sync_state.request_block(&h.hash) {
-                    to_request.push(Inventory {
-                        inv_type: InvType::Block,
-                        hash: h.hash.clone(),
-                    });
-                }
-            }
-        }
         drop(chain);
-        if !to_request.is_empty() {
-            self.queue_message(id, &Message::GetData(to_request));
+
+        // The per-block validation in `accept_block` already checks the
+        // index sequence, the previous hash, the hash consistency, and the
+        // merkle root. The sequential check on the header batch is
+        // therefore redundant, and disconnecting the peer because a single
+        // header in the batch does not chain to its predecessor would stop
+        // the sync entirely. Every block is validated individually when it
+        // is received.
+
+        self.sync_state.best_known_height = self.sync_state.best_known_height.max(
+            headers.iter().map(|h| h.index).max().unwrap_or(0),
+        );
+
+        for h in headers {
+            if !self.header_chain.iter().any(|b| b.hash == h.hash) {
+                self.header_chain.push(h);
+            }
         }
+
+        self.header_chain.sort_by_key(|b| b.index);
+        self.header_chain.dedup_by_key(|b| b.index);
+
+        self.send_getheaders(id).await;
     }
 
     async fn handle_block(&mut self, id: u64, block: Block) {
-        self.sync_state.received_block(&block.hash);
+        let height = block.index;
+        let hash = block.hash.clone();
+
+        self.sync_state.received_block(id, &hash, height);
 
         let mut chain = self.chain.write().await;
         match crate::p2p::sync::SyncState::accept_block(&mut chain, block.clone()) {
             Ok(_) => {
-                self.inv.add_block(&block.hash);
-                
-                // SEPARATION OF CONCERNS: Only save the block to the flat file database (blocks/).
-                // Do NOT save the state trie here. The trie is updated lazily during mining or shutdown.
-                // This prevents I/O blocking during heavy P2P sync.
+                self.inv.add_block(&hash);
+                self.sync_state.connected_block(&hash);
+
                 let _ = storage::save_block_only(&block);
-                
+
                 drop(chain);
+
+                // A successfully connected block proves that the current
+                // stalling timeout is not too short. Halve it back toward
+                // the base value, mirroring the reference node's adaptive
+                // stalling timeout behaviour.
+                let halved = self.stalling_timeout / 2;
+                self.stalling_timeout = halved.max(BASE_BLOCK_STALLING_TIMEOUT);
+
                 self.broadcast_inv_to_full_relay(&[Inventory {
                     inv_type: InvType::Block,
-                    hash: block.hash.clone(),
+                    hash: hash.clone(),
                 }]);
 
-                println!("[p2p] block {} accepted from {}", block.index, id);
+                println!("[p2p] block {} accepted from {}", height, id);
 
-                if self.sync_state.in_flight_count() < 16 {
-                    self.send_getheaders(id).await;
-                }
+                self.request_blocks_from_peers().await;
             }
             Err(e) => {
                 drop(chain);
+
+                // A state root mismatch is a consensus failure, not a peer
+                // misbehavior. The peer is only relaying a block that its
+                // own miner produced, and the miner may be running buggy
+                // code. Disconnecting the peer would not fix the chain and
+                // would only reduce our connectivity. Send a reject
+                // message, mark the block as invalid, and keep the
+                // connection open.
+                if e.contains("state root mismatch") {
+                    println!(
+                        "[p2p] block {} from {} has a state root mismatch; sending reject and marking it invalid: {}",
+                        height, id, e
+                    );
+                    self.inv.add_block(&hash);
+                    self.sync_state.connected_block(&hash);
+                    self.header_chain.retain(|b| b.hash != hash);
+                    for peer_id in self.sync_state.peer_states.keys().copied().collect::<Vec<_>>() {
+                        self.sync_state.remove_in_flight(peer_id, &hash);
+                    }
+                    self.queue_message(
+                        id,
+                        &Message::Reject {
+                            command: "block".to_string(),
+                            code: 0x10,
+                            reason: format!("state root mismatch: {}", e),
+                        },
+                    );
+                    return;
+                }
+
                 if e.contains("already exists") {
-                    self.inv.add_block(&block.hash);
+                    self.inv.add_block(&hash);
+                    self.sync_state.connected_block(&hash);
+                    self.header_chain.retain(|b| b.hash != hash);
                     return;
                 }
                 if e.contains("does not follow tip") {
-                    println!(
-                        "[p2p] block from {} does not follow tip, requesting headers",
-                        id
-                    );
                     self.send_getheaders(id).await;
+                } else if e.contains("new chain has less or equal work") {
+                    // The peer sent a block that does not extend our chain
+                    // with more work. This is not a misbehavior: the peer
+                    // may be on a competing chain with equal work. Ignore
+                    // the block and keep the connection open.
+                    println!(
+                        "[p2p] ignoring block {} from {}: equal or lower chainwork",
+                        hash, id
+                    );
                 } else {
+                    // For every other kind of failure (invalid PoW, bad
+                    // signature, malformed transaction, ...) the peer is
+                    // either malicious or badly broken, so punish it.
                     self.punish(id, 50, &format!("block rejected: {}", e)).await;
                 }
             }
@@ -1084,6 +1291,7 @@ impl Network {
                     && (p.conn_type == ConnectionType::OutboundFullRelay
                         || p.conn_type == ConnectionType::Inbound)
             })
+            .filter(|p| self.connections.contains_key(&p.id))
             .map(|p| p.id)
             .collect();
 
@@ -1106,13 +1314,14 @@ impl Network {
     }
 
     async fn disconnect(&mut self, id: u64, reason: &str) {
+        self.sync_state.remove_peer(id);
         if let Some(mut conn) = self.connections.remove(&id) {
             let _ = conn.stream.shutdown().await;
             if let Some(idx) = self.block_relay_peers.iter().position(|a| *a == conn.addr) {
                 self.block_relay_peers.remove(idx);
             }
         }
-        self.peer_manager.remove(id, reason);
+        self.peer_manager.remove_silent(id);
         println!("[p2p] disconnect {}: {}", id, reason);
     }
 
@@ -1122,6 +1331,7 @@ impl Network {
             match ev {
                 PeerEvent::HandshakeComplete(id) => {
                     println!("[p2p] handshake complete with {}", id);
+                    self.sync_state.register_peer(id);
                     self.send_getheaders(id).await;
                     self.queue_message(id, &Message::GetAddr);
                 }
@@ -1130,17 +1340,36 @@ impl Network {
                 }
                 PeerEvent::Disconnected(id, reason) => {
                     self.connections.remove(&id);
+                    self.sync_state.remove_peer(id);
                     println!("[p2p] peer {} disconnected: {}", id, reason);
+
+                    if reason.contains("stalling") {
+                        // Double the adaptive stalling timeout, capped at
+                        // the maximum, mirroring the reference node.
+                        let doubled = self.stalling_timeout * 2;
+                        self.stalling_timeout = doubled.min(MAX_BLOCK_STALLING_TIMEOUT);
+                    }
 
                     if let Some(peer) = self.peer_manager.get(id) {
                         if peer.outbound {
                             let addr = peer.addr;
                             if !self.banman.is_banned(&addr) {
                                 self.addr_book.add(addr);
-                                self.addr_book.reset_try(addr);
+                                // Do not reset the failure counter when the
+                                // disconnect was caused by stalling. Leaving
+                                // the counter untouched lets the address
+                                // book back off and prevents the connect
+                                // loop from reconnecting to the same
+                                // unresponsive peer on every tick.
+                                if !reason.contains("stalling") {
+                                    self.addr_book.reset_try(addr);
+                                }
                             }
                         }
                     }
+                    // Remove the peer from the peer manager without
+                    // pushing another Disconnected event.
+                    self.peer_manager.remove_silent(id);
                 }
                 PeerEvent::Banned(id, reason) => {
                     println!("[p2p] peer {} banned: {}", id, reason);
@@ -1236,7 +1465,7 @@ fn build_headers_response(chain: &Blockchain, loc: &BlockLocator) -> Vec<Block> 
             break;
         }
     }
-    let end = (start + peers::HEADERS_PER_REQUEST).min(chain.chain.len() as u64);
+    let end = (start + MAX_HEADERS_RESULTS).min(chain.chain.len() as u64);
     chain.chain[start as usize..end as usize]
         .iter()
         .map(|b| {

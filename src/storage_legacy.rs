@@ -13,6 +13,7 @@ use crate::consensus::genesis;
 use crate::consensus::spec;
 use crate::datadir;
 use crate::storage::Account;
+use crate::storage::BlockStore;
 use crate::validation;
 
 pub const BLOCKS_PER_FILE: usize = 1000;
@@ -21,19 +22,15 @@ pub const BLOCKS_PER_FILE: usize = 1000;
 ///
 /// The order of operations is important:
 ///   1. Flush the state database so that `root_hash.txt` is written.
-///   2. Save the blocks, mempool, and state snapshot.
+///   2. Save the mempool and state snapshot.
+///   3. Persist every block that is not yet in the append-only block store.
 ///
-/// Step 1 must happen before step 2 so that the state root committed in
-/// the tip block always has a corresponding `root_hash.txt` on disk.
-/// This mirrors the order used by reference node implementations, which
-/// flush the state to disk before persisting the block index.
-///
-/// # Signature
-///
-/// `chain` is taken as `&mut` because `StateDB::flush()` requires
-/// `&mut self`. The alternative — opening a second `StateDB` instance
-/// on the same path — is rejected by the underlying database, which
-/// holds an exclusive lock on the directory.
+/// Blocks are normally written to disk by `save_block_only` as soon as they
+/// are accepted through P2P, but blocks produced by the local miner
+/// (`generatetoaddress`) or submitted through RPC (`submitblock`) never go
+/// through that path. This function closes the gap: it walks the in-memory
+/// chain and appends any missing block to the block store. `write_block` is
+/// idempotent, so calling it on every save is safe.
 pub fn save_chain(chain: &mut Blockchain) -> std::io::Result<()> {
     datadir::ensure_dirs()?;
 
@@ -43,10 +40,23 @@ pub fn save_chain(chain: &mut Blockchain) -> std::io::Result<()> {
         .flush()
         .map_err(|e| Error::other(format!("failed to flush state: {}", e)))?;
 
-    // Step 2: persist blocks, mempool, and the state snapshot.
-    save_blocks(chain)?;
+    // Step 2: persist mempool and the state snapshot.
     save_mempool(&chain.mempool)?;
     save_state_snapshot(chain)?;
+
+    // Step 3: persist every block to the append-only block store.
+    // `write_block` is idempotent, so re-writing already-stored blocks
+    // is harmless and guarantees that locally mined blocks are persisted.
+    if let Ok(store) = BlockStore::open_default() {
+        for block in &chain.chain {
+            if let Err(e) = store.write_block(block) {
+                eprintln!(
+                    "[storage] WARNING: failed to persist block {}: {}",
+                    block.index, e
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -54,15 +64,80 @@ pub fn save_chain(chain: &mut Blockchain) -> std::io::Result<()> {
 pub fn load_chain() -> std::io::Result<Blockchain> {
     let db_path = datadir::state_db_path();
 
-    let mut blocks = load_blocks()?;
+    let store = BlockStore::open_default()
+        .map_err(|e| Error::other(format!("failed to open block store: {}", e)))?;
+
+    let mut blocks = store
+        .all_blocks()
+        .map_err(|e| Error::other(format!("failed to read blocks: {}", e)))?;
+
+    let expected_genesis_hash =
+        genesis::expected_genesis_hash_for(spec::current_network());
+
+    // If the block store does not start with genesis, try to find it
+    // among the stored blocks and prepend it. This handles datadirs that
+    // were created by older versions of the code, which never persisted
+    // the genesis block to the append-only store.
+    if !blocks.is_empty()
+        && (blocks[0].index != 0 || blocks[0].hash != expected_genesis_hash)
+    {
+        if let Some(pos) = blocks
+            .iter()
+            .position(|b| b.index == 0 && b.hash == expected_genesis_hash)
+        {
+            let genesis_block = blocks.remove(pos);
+            blocks.insert(0, genesis_block);
+            if let Err(e) = store.write_block(&blocks[0]) {
+                eprintln!(
+                    "[storage] WARNING: failed to persist recovered genesis block: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Fallback: if the block index is empty (for example, because the
+    // datadir was created before the append-only block store was
+    // introduced), read blocks from the legacy whole-Vec files and
+    // re-index them into the block store so that future starts are fast.
+    if blocks.is_empty() {
+        let legacy = load_blocks()?;
+        if !legacy.is_empty() {
+            for block in &legacy {
+                let _ = store.write_block(block);
+            }
+            blocks = legacy;
+        }
+    }
+
     if blocks.is_empty() {
         return Ok(Blockchain::new());
     }
 
+    // If the stored chain still does not start with genesis, reconstruct
+    // the genesis block from the compiled-in parameters and prepend it.
+    // This is safe because the genesis block is deterministic and the
+    // first stored block must extend it. Datadirs created before the
+    // genesis block was persisted to the block store fall into this
+    // branch and are recovered without requiring a full reindex.
     if blocks[0].index != 0 {
-        return Err(Error::other(
-            "consensus failure: the first block on disk is not the genesis block.",
-        ));
+        let genesis_block = Block::genesis();
+        if blocks[0].index == 1
+            && blocks[0].previous_hash == genesis_block.hash
+            && genesis_block.hash == expected_genesis_hash
+        {
+            if let Err(e) = store.write_block(&genesis_block) {
+                eprintln!(
+                    "[storage] WARNING: failed to persist reconstructed genesis block: {}",
+                    e
+                );
+            }
+            blocks.insert(0, genesis_block);
+        } else {
+            return Err(Error::other(
+                "consensus failure: the first block on disk is not the genesis block.",
+            ));
+        }
     }
     if blocks[0].previous_hash != crate::consensus::rules::ZERO_HASH {
         return Err(Error::other(
@@ -94,8 +169,6 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
     // This check mirrors the behaviour of reference node implementations,
     // which refuse to start when the on-disk genesis block does not match
     // the consensus parameters compiled into the binary.
-    let expected_genesis_hash =
-        genesis::expected_genesis_hash_for(spec::current_network());
     if blocks[0].hash != expected_genesis_hash {
         return Err(Error::other(format!(
             "consensus failure: the genesis block on disk (hash {}) does not match \
@@ -140,6 +213,50 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
         state,
     };
 
+    // Populate the address list from the state snapshot and from the
+    // block history. The address list is used by GetStateRange to serve
+    // accounts to peers during fast sync, so it must be complete even if
+    // the snapshot file is missing or empty.
+    chain.addresses.push("GENESIS".to_string());
+
+    let snapshot_path = datadir::chainstate_dir().join("state_snapshot.json");
+    if let Ok(data) = std::fs::read_to_string(&snapshot_path) {
+        if let Ok(map) =
+            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data)
+        {
+            for addr in map.keys() {
+                if !chain.addresses.contains(addr) {
+                    chain.addresses.push(addr.clone());
+                }
+            }
+        }
+    }
+
+    // Always walk the block history to recover addresses that are not
+    // present in the snapshot. This is cheap because the chain is
+    // already loaded in memory.
+    for block in chain.chain.iter() {
+        if !block.mined_for.is_empty() && !chain.addresses.contains(&block.mined_for) {
+            chain.addresses.push(block.mined_for.clone());
+        }
+        for tx in &block.transactions {
+            if validation::is_special_tx(tx) {
+                continue;
+            }
+            if !chain.addresses.contains(&tx.from) {
+                chain.addresses.push(tx.from.clone());
+            }
+            if !chain.addresses.contains(&tx.to) {
+                chain.addresses.push(tx.to.clone());
+            }
+        }
+    }
+
+    println!(
+        "[node] loaded {} addresses from state snapshot and block history",
+        chain.addresses.len()
+    );
+
     if reindex_requested {
         eprintln!("[node] Rebuilding state from block history...");
         if let Err(e) = rebuild_state_from_blocks(&mut chain) {
@@ -180,7 +297,7 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
             &Account {
                 nonce: 0,
                 balance: genesis_block.reward,
-                immature_rewards: Vec::new(),
+                immature_rewards: BTreeMap::new(),
                 code: Vec::new(),
                 storage: BTreeMap::new(),
             },
@@ -198,12 +315,25 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
                     tx.nonce,
                     block.index,
                 ).map_err(|e| Error::other(format!("Failed to apply tx {}: {}", tx.txid, e)))?;
+                if !chain.addresses.contains(&tx.from) {
+                    chain.addresses.push(tx.from.clone());
+                }
+                if !chain.addresses.contains(&tx.to) {
+                    chain.addresses.push(tx.to.clone());
+                }
             }
         }
         chain.state.credit_reward(&block.mined_for, block.reward, block.index)
             .map_err(|e| Error::other(format!("Failed to credit reward block {}: {}", block.index, e)))?;
+        if !block.mined_for.is_empty() && !chain.addresses.contains(&block.mined_for) {
+            chain.addresses.push(block.mined_for.clone());
+        }
     }
 
+    println!(
+        "[node] reindex populated {} addresses",
+        chain.addresses.len()
+    );
     Ok(())
 }
 
@@ -245,17 +375,21 @@ fn verify_state_root(chain: &mut Blockchain) -> std::io::Result<()> {
 struct AccountSnapshot {
     nonce: u64,
     balance: u64,
-    immature_rewards: Vec<(u64, u64)>,
+    /// Immature rewards keyed by height. The snapshot mirrors the
+    /// in-memory account representation so that a snapshot written by an
+    /// older build (which stored a `Vec`) fails to deserialize instead
+    /// of silently producing a different state.
+    immature_rewards: BTreeMap<u64, u64>,
     code: Vec<u8>,
     storage: Vec<(String, String)>,
 }
 
 pub fn save_state_snapshot(chain: &Blockchain) -> std::io::Result<()> {
-    if chain.addresses.len() <= 1 {
-        return Ok(());
-    }
+    // Write the snapshot even if the address list is small, so that
+    // load_chain can recover the addresses from it on the next start.
+    let mut accounts: std::collections::HashMap<String, AccountSnapshot> =
+        std::collections::HashMap::new();
 
-    let mut accounts: std::collections::HashMap<String, AccountSnapshot> = std::collections::HashMap::new();
     for addr in &chain.addresses {
         if let Ok(Some(acc)) = chain.state.get_account(addr) {
             let storage_hex: Vec<(String, String)> = acc
@@ -275,10 +409,16 @@ pub fn save_state_snapshot(chain: &Blockchain) -> std::io::Result<()> {
             );
         }
     }
+
     let json = serde_json::to_string_pretty(&accounts).map_err(Error::other)?;
     std::fs::write(datadir::chainstate_dir().join("state_snapshot.json"), json)
 }
 
+/// Write all blocks in the chain to the legacy whole-Vec block files.
+///
+/// This function is kept for backward compatibility with datadirs
+/// created before the append-only block store was introduced. New
+/// blocks are written by `save_block_only` through the block store.
 pub fn save_blocks(chain: &Blockchain) -> std::io::Result<()> {
     let total = chain.chain.len();
     let mut file_index = 0u32;
@@ -302,6 +442,13 @@ pub fn save_blocks(chain: &Blockchain) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Load all blocks from the legacy whole-Vec block files.
+///
+/// The loader tries the whole-`Vec<Block>` format first, because that is
+/// the format written by `save_blocks` and used by datadirs created
+/// before the append-only block store was introduced. If that fails, it
+/// falls back to the length-prefixed append format written by
+/// `crate::storage::save_block_only`.
 pub fn load_blocks() -> std::io::Result<Vec<Block>> {
     let mut all: Vec<Block> = Vec::new();
     let mut i = 0u32;
@@ -312,15 +459,62 @@ pub fn load_blocks() -> std::io::Result<Vec<Block>> {
             break;
         }
 
-        let mut file = std::fs::File::open(path)?;
+        let mut file = std::fs::File::open(&path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        let mut chunk: Vec<Block> = bincode::deserialize(&buffer)
-            .map_err(|e| Error::other(format!("bincode deserialize error: {}", e)))?;
+        if buffer.is_empty() {
+            i += 1;
+            continue;
+        }
 
-        all.append(&mut chunk);
-        i += 1;
+        // Try the whole-Vec format first.
+        match bincode::deserialize::<Vec<Block>>(&buffer) {
+            Ok(mut chunk) => {
+                all.append(&mut chunk);
+                i += 1;
+                continue;
+            }
+            Err(_) => {}
+        }
+
+        // Fall back to the length-prefixed append format.
+        let mut offset = 0usize;
+        let mut ok = true;
+        let mut blocks = Vec::new();
+        while offset + 4 <= buffer.len() {
+            let len_bytes = &buffer[offset..offset + 4];
+            let len = u32::from_le_bytes([
+                len_bytes[0],
+                len_bytes[1],
+                len_bytes[2],
+                len_bytes[3],
+            ]) as usize;
+            offset += 4;
+            if offset + len > buffer.len() {
+                ok = false;
+                break;
+            }
+            match bincode::deserialize::<Block>(&buffer[offset..offset + len]) {
+                Ok(b) => blocks.push(b),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+            offset += len;
+        }
+
+        if ok && !blocks.is_empty() {
+            all.extend(blocks);
+            i += 1;
+            continue;
+        }
+
+        return Err(Error::other(format!(
+            "bincode deserialize error in {}",
+            path.display()
+        )));
     }
     Ok(all)
 }

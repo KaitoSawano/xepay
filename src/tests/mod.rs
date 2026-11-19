@@ -16,4 +16,5 @@ mod pow_test;
 mod security_hardening_test;
 mod sendtoaddress_test;
 mod storage_test;
+mod state_determinism_test;
 mod validation_test;

@@ -105,6 +105,21 @@ impl AddrBook {
         }
     }
 
+    /// Reset the failure counter and last_try time for every address in
+    /// the book.
+    ///
+    /// This is used as a last resort when the node has no connected peers
+    /// and no candidate addresses: instead of staying isolated forever,
+    /// every address becomes eligible for a connection attempt again.
+    /// The `attempts` counter is left untouched so that long-lived
+    /// statistics are preserved.
+    pub fn reset_all_failures(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.failures = 0;
+            entry.last_try = None;
+        }
+    }
+
     /// Return candidate addresses that have not been attempted recently.
     pub fn candidates(&self, min_interval: Duration, limit: usize) -> Vec<SocketAddr> {
         let now = Instant::now();

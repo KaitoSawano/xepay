@@ -313,7 +313,7 @@ impl Blockchain {
                     &Account {
                         nonce: 0,
                         balance: genesis.reward,
-                        immature_rewards: Vec::new(),
+                        immature_rewards: BTreeMap::new(),
                         code: Vec::new(),
                         storage: BTreeMap::new(),
                     },
@@ -655,15 +655,28 @@ impl Blockchain {
         let txs = std::mem::take(&mut self.mempool);
         self.mempool_timestamps.clear();
 
-        for tx in &txs {
-            if let Err(e) = validation::validate_transaction(self, tx) {
+        // Order the transactions so that every sender's nonces are
+        // processed in ascending order. Without this sort, a batch of
+        // transactions from the same sender would be validated against
+        // the pre-batch nonce, and every transaction after the first one
+        // would be dropped as an invalid nonce.
+        let mut sorted_txs = txs;
+        sorted_txs.sort_by(|a, b| {
+            a.from
+                .cmp(&b.from)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+
+        let mut valid_txs = Vec::new();
+        for tx in sorted_txs {
+            if let Err(e) = validation::validate_transaction(self, &tx) {
                 return Err(format!("mempool transaction failed validation: {}", e));
             }
+            self.apply_and_execute_transaction(&tx)?;
+            valid_txs.push(tx);
         }
 
-        for tx in &txs {
-            self.apply_and_execute_transaction(tx)?;
-        }
+        let total_fees: u64 = valid_txs.iter().map(|tx| tx.fee).sum();
 
         self.credit_reward(&prev.mined_for, reward, next_index)?;
 
@@ -675,7 +688,7 @@ impl Blockchain {
             subsidy,
             total_fees,
             self.nbits,
-            txs.clone(),
+            valid_txs.clone(),
             String::new(),
             state_root,
             prev.chainwork,

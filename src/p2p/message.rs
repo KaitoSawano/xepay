@@ -8,7 +8,6 @@
 //! lengths use a varint encoding, and hashes are encoded as 32 raw bytes.
 
 use crate::block::Block;
-use crate::blockchain::Blockchain;
 use crate::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +99,7 @@ pub enum Message {
     Verack,
     Inv(Vec<Inventory>),
     GetData(Vec<Inventory>),
+    NotFound(Vec<Inventory>),
     GetHeaders(BlockLocator),
     Headers(Vec<Block>),
     Block(Block),
@@ -122,6 +122,7 @@ impl Message {
             Message::Verack => "verack",
             Message::Inv(_) => "inv",
             Message::GetData(_) => "getdata",
+            Message::NotFound(_) => "notfound",
             Message::GetHeaders(_) => "getheaders",
             Message::Headers(_) => "headers",
             Message::Block(_) => "block",
@@ -235,7 +236,7 @@ impl Message {
                 out.push(if v.relay { 1 } else { 0 });
             }
             Message::Verack => {}
-            Message::Inv(items) | Message::GetData(items) => {
+            Message::Inv(items) | Message::GetData(items) | Message::NotFound(items) => {
                 write_varint(&mut out, items.len() as u64);
                 for inv in items {
                     out.extend_from_slice(&(inv.inv_type as u32).to_le_bytes());
@@ -254,22 +255,15 @@ impl Message {
                 out.extend_from_slice(&b);
             }
             Message::Headers(headers) => {
-                write_varint(&mut out, headers.len() as u64);
-                for h in headers {
-                    out.extend_from_slice(&h.nversion.to_le_bytes());
-                    out.extend_from_slice(&h.index.to_le_bytes());
-                    out.extend_from_slice(&h.timestamp.to_le_bytes());
-                    let prev = hex::decode(&h.previous_hash).unwrap_or_else(|_| vec![0u8; 32]);
-                    out.extend_from_slice(&prev);
-                    let merkle = hex::decode(&h.merkle_root).unwrap_or_else(|_| vec![0u8; 32]);
-                    out.extend_from_slice(&merkle);
-                    out.extend_from_slice(&h.nonce.to_le_bytes());
-                    out.extend_from_slice(&h.nbits.to_le_bytes());
-                    out.extend_from_slice(&h.reward.to_le_bytes());
-                    let hash = hex::decode(&h.hash).unwrap_or_else(|_| vec![0u8; 32]);
-                    out.extend_from_slice(&hash);
-                    write_varint(&mut out, 0);
-                }
+                // The headers are serialized with `serde_json`, the same
+                // way full blocks and transactions are serialized. The
+                // previous manual encoding did not carry the state root,
+                // the chainwork, the coinbase txid, or the blockchain
+                // size, so a header decoded from the wire could never
+                // match its own hash. Using `serde_json` keeps every
+                // field of the header intact and makes the round trip
+                // exact.
+                out.extend_from_slice(&serde_json::to_vec(headers).unwrap_or_default());
             }
             Message::Block(b) => {
                 out.extend_from_slice(&serde_json::to_vec(b).unwrap_or_default());
@@ -337,7 +331,7 @@ impl Message {
                 }))
             }
             "verack" => Ok(Message::Verack),
-            "inv" | "getdata" => {
+            "inv" | "getdata" | "notfound" => {
                 let count = read_varint(&mut input)? as usize;
                 // FIX BUG AZ: Enforce a maximum count to prevent OOM panic.
                 if count > MAX_INV_ITEMS {
@@ -355,10 +349,11 @@ impl Message {
                     input = &input[32..];
                     items.push(Inventory { inv_type, hash });
                 }
-                if command == "inv" {
-                    Ok(Message::Inv(items))
-                } else {
-                    Ok(Message::GetData(items))
+                match command {
+                    "inv" => Ok(Message::Inv(items)),
+                    "getdata" => Ok(Message::GetData(items)),
+                    "notfound" => Ok(Message::NotFound(items)),
+                    _ => unreachable!(),
                 }
             }
             "getheaders" => {
@@ -390,47 +385,16 @@ impl Message {
                 }))
             }
             "headers" => {
-                let count = read_varint(&mut input)? as usize;
-                if count > MAX_HEADERS_ITEMS {
-                    return Err(format!("headers: too many headers ({})", count));
-                }
-                let mut headers = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if input.len() < 4 + 8 + 16 + 32 + 32 + 8 + 4 + 8 + 32 + 1 {
-                        return Err("headers: header missing bytes".into());
-                    }
-                    let nversion = u32::from_le_bytes(input[..4].try_into().unwrap());
-                    input = &input[4..];
-                    let index = u64::from_le_bytes(input[..8].try_into().unwrap());
-                    input = &input[8..];
-                    let timestamp = u128::from_le_bytes(input[..16].try_into().unwrap());
-                    input = &input[16..];
-                    let previous_hash = hex::encode(&input[..32]);
-                    input = &input[32..];
-                    let merkle_root = hex::encode(&input[..32]);
-                    input = &input[32..];
-                    let nonce = u64::from_le_bytes(input[..8].try_into().unwrap());
-                    input = &input[8..];
-                    let nbits = u32::from_le_bytes(input[..4].try_into().unwrap());
-                    input = &input[4..];
-                    let reward = u64::from_le_bytes(input[..8].try_into().unwrap());
-                    input = &input[8..];
-                    let hash = hex::encode(&input[..32]);
-                    input = &input[32..];
-                    let _tx_count = read_varint(&mut input)?;
-
-                    let mut b = Block::new(index, previous_hash.clone(), reward, nbits, Vec::new())
-                        .map_err(|e| format!("headers: invalid header at index {}: {}", index, e))?;
-                    b.nversion = nversion;
-                    b.timestamp = timestamp;
-                    b.previous_hash = previous_hash;
-                    b.merkle_root = merkle_root;
-                    b.nonce = nonce;
-                    b.nbits = nbits;
-                    b.hash = hash;
-                    b.reward = reward;
-                    b.subsidy = Blockchain::calculate_reward(index);
-                    headers.push(b);
+                // The headers are deserialized with `serde_json`, the
+                // same way full blocks and transactions are deserialized.
+                // This keeps every field of the header intact, so the
+                // previous hash of each header matches the hash of the
+                // previous header exactly and the sequential check in the
+                // network layer never fails on a valid header chain.
+                let headers: Vec<Block> =
+                    serde_json::from_slice(payload).map_err(|e| format!("headers: {}", e))?;
+                if headers.len() > MAX_HEADERS_ITEMS {
+                    return Err(format!("headers: too many headers ({})", headers.len()));
                 }
                 Ok(Message::Headers(headers))
             }
@@ -549,6 +513,21 @@ mod tests {
         match decoded {
             Message::Inv(items2) => assert_eq!(items2, items),
             _ => panic!("expected an Inv message"),
+        }
+    }
+
+    #[test]
+    fn notfound_roundtrip() {
+        let items = vec![Inventory {
+            inv_type: InvType::Block,
+            hash: "cc".repeat(32),
+        }];
+        let msg = Message::NotFound(items.clone());
+        let bytes = msg.serialize();
+        let decoded = Message::deserialize("notfound", &bytes).unwrap();
+        match decoded {
+            Message::NotFound(items2) => assert_eq!(items2, items),
+            _ => panic!("expected a NotFound message"),
         }
     }
 
