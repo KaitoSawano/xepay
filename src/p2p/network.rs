@@ -25,7 +25,7 @@ use crate::p2p::inv::InventoryManager;
 use crate::p2p::message::{BlockLocator, InvType, Inventory, Message};
 use crate::p2p::peer::{ConnectionType, PeerState};
 use crate::p2p::peer_manager::{PeerEvent, PeerManager};
-use crate::p2p::sync::{SyncState, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS};
+use crate::p2p::sync::{BlockOutcome, SyncState, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS};
 use crate::storage;
 use crate::utils::{format_datetime, now_millis};
 use crate::validation;
@@ -1166,7 +1166,7 @@ impl Network {
         }
         drop(chain);
 
-        // The per-block validation in `accept_block` already checks the
+        // The per-block validation in `process_block` already checks the
         // index sequence, the previous hash, the hash consistency, and the
         // merkle root. The sequential check on the header batch is
         // therefore redundant, and disconnecting the peer because a single
@@ -1197,14 +1197,13 @@ impl Network {
         self.sync_state.received_block(id, &hash, height);
 
         let mut chain = self.chain.write().await;
-        match crate::p2p::sync::SyncState::accept_block(&mut chain, block.clone()) {
-            Ok(_) => {
+        let outcome = SyncState::process_block(&mut chain, block, Some(id), &mut self.sync_state);
+        drop(chain);
+
+        match outcome {
+            Ok(BlockOutcome::Connected) => {
                 self.inv.add_block(&hash);
                 self.sync_state.connected_block(&hash);
-
-                let _ = storage::save_block_only(&block);
-
-                drop(chain);
 
                 // A successfully connected block proves that the current
                 // stalling timeout is not too short. Halve it back toward
@@ -1222,61 +1221,39 @@ impl Network {
 
                 self.request_blocks_from_peers().await;
             }
+            Ok(BlockOutcome::SideChain) => {
+                self.inv.add_block(&hash);
+                self.sync_state.connected_block(&hash);
+                println!(
+                    "[p2p] block {} from {} stored on a side branch",
+                    height, id
+                );
+            }
+            Ok(BlockOutcome::Reorganized) => {
+                self.inv.add_block(&hash);
+                self.sync_state.connected_block(&hash);
+                println!(
+                    "[p2p] block {} from {} triggered a reorganization",
+                    height, id
+                );
+                self.request_blocks_from_peers().await;
+            }
+            Ok(BlockOutcome::Orphan) => {
+                // An orphan is not misbehavior. Request the missing
+                // parent from the same peer and keep the connection.
+                println!(
+                    "[p2p] block {} from {} is an orphan; requesting its parent",
+                    height, id
+                );
+                self.send_getheaders(id).await;
+            }
+            Ok(BlockOutcome::Duplicate) => {
+                // Already known. Nothing to do.
+            }
             Err(e) => {
-                drop(chain);
-
-                // A state root mismatch is a consensus failure, not a peer
-                // misbehavior. The peer is only relaying a block that its
-                // own miner produced, and the miner may be running buggy
-                // code. Disconnecting the peer would not fix the chain and
-                // would only reduce our connectivity. Send a reject
-                // message, mark the block as invalid, and keep the
-                // connection open.
-                if e.contains("state root mismatch") {
-                    println!(
-                        "[p2p] block {} from {} has a state root mismatch; sending reject and marking it invalid: {}",
-                        height, id, e
-                    );
-                    self.inv.add_block(&hash);
-                    self.sync_state.connected_block(&hash);
-                    self.header_chain.retain(|b| b.hash != hash);
-                    for peer_id in self.sync_state.peer_states.keys().copied().collect::<Vec<_>>() {
-                        self.sync_state.remove_in_flight(peer_id, &hash);
-                    }
-                    self.queue_message(
-                        id,
-                        &Message::Reject {
-                            command: "block".to_string(),
-                            code: 0x10,
-                            reason: format!("state root mismatch: {}", e),
-                        },
-                    );
-                    return;
-                }
-
-                if e.contains("already exists") {
-                    self.inv.add_block(&hash);
-                    self.sync_state.connected_block(&hash);
-                    self.header_chain.retain(|b| b.hash != hash);
-                    return;
-                }
-                if e.contains("does not follow tip") {
-                    self.send_getheaders(id).await;
-                } else if e.contains("new chain has less or equal work") {
-                    // The peer sent a block that does not extend our chain
-                    // with more work. This is not a misbehavior: the peer
-                    // may be on a competing chain with equal work. Ignore
-                    // the block and keep the connection open.
-                    println!(
-                        "[p2p] ignoring block {} from {}: equal or lower chainwork",
-                        hash, id
-                    );
-                } else {
-                    // For every other kind of failure (invalid PoW, bad
-                    // signature, malformed transaction, ...) the peer is
-                    // either malicious or badly broken, so punish it.
-                    self.punish(id, 50, &format!("block rejected: {}", e)).await;
-                }
+                // The block failed validation. The peer is either
+                // malicious or badly broken, so punish it.
+                self.punish(id, 50, &format!("block rejected: {}", e)).await;
             }
         }
     }

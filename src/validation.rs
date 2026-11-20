@@ -651,10 +651,21 @@ pub fn validate_block_transactions(
 ) -> Result<(), ValidationError> {
     let mut overlay_balances: BTreeMap<String, u64> = BTreeMap::new();
     let mut overlay_nonces: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seen_txids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for tx in transactions {
         if is_special_tx(tx) {
             continue;
+        }
+
+        // Bitcoin-Grade: reject a block that contains the same txid twice.
+        // Without this check, a miner could include the same transaction
+        // multiple times and inflate the effective supply.
+        if !seen_txids.insert(tx.txid.clone()) {
+            return Err(ValidationError::new(
+                "E025",
+                format!("duplicate txid in block: {}", tx.txid),
+            ));
         }
 
         // Structural checks that do not depend on the chain state.

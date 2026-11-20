@@ -13,6 +13,7 @@ use crate::consensus::genesis;
 use crate::consensus::spec;
 use crate::datadir;
 use crate::storage::Account;
+use crate::storage::block_index::BlockStatus;
 use crate::storage::BlockStore;
 use crate::validation;
 
@@ -49,7 +50,7 @@ pub fn save_chain(chain: &mut Blockchain) -> std::io::Result<()> {
     // is harmless and guarantees that locally mined blocks are persisted.
     if let Ok(store) = BlockStore::open_default() {
         for block in &chain.chain {
-            if let Err(e) = store.write_block(block) {
+            if let Err(e) = store.write_block(block, BlockStatus::Active) {
                 eprintln!(
                     "[storage] WARNING: failed to persist block {}: {}",
                     block.index, e
@@ -87,7 +88,7 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
         {
             let genesis_block = blocks.remove(pos);
             blocks.insert(0, genesis_block);
-            if let Err(e) = store.write_block(&blocks[0]) {
+            if let Err(e) = store.write_block(&blocks[0], BlockStatus::Active) {
                 eprintln!(
                     "[storage] WARNING: failed to persist recovered genesis block: {}",
                     e
@@ -104,7 +105,7 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
         let legacy = load_blocks()?;
         if !legacy.is_empty() {
             for block in &legacy {
-                let _ = store.write_block(block);
+                let _ = store.write_block(block, BlockStatus::Active);
             }
             blocks = legacy;
         }
@@ -126,7 +127,7 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
             && blocks[0].previous_hash == genesis_block.hash
             && genesis_block.hash == expected_genesis_hash
         {
-            if let Err(e) = store.write_block(&genesis_block) {
+            if let Err(e) = store.write_block(&genesis_block, BlockStatus::Active) {
                 eprintln!(
                     "[storage] WARNING: failed to persist reconstructed genesis block: {}",
                     e

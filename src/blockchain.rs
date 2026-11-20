@@ -670,6 +670,12 @@ impl Blockchain {
         let mut valid_txs = Vec::new();
         for tx in sorted_txs {
             if let Err(e) = validation::validate_transaction(self, &tx) {
+                // Restore the mempool so that the remaining transactions
+                // are not lost, and abort the mining attempt. A miner
+                // must never produce a block that contains a transaction
+                // that fails consensus validation.
+                self.mempool = valid_txs;
+                self.mempool.push(tx);
                 return Err(format!("mempool transaction failed validation: {}", e));
             }
             self.apply_and_execute_transaction(&tx)?;

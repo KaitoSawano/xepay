@@ -5,13 +5,18 @@
 //! Append-only block storage in flat files, modeled after Bitcoin Core's
 //! `blk*.dat` files. Each block is written with a 4-byte network magic
 //! followed by a 4-byte little-endian size and the bincode-encoded block.
+//!
+//! The store is shared by every branch of the block tree. A block is
+//! written once, and its location is recorded in the block index. The
+//! active chain is a path through the index; side branches are kept in
+//! the same files and distinguished only by the index status.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::block::Block;
-use crate::storage::block_index::BlockIndex;
+use crate::storage::block_index::{BlockIndex, BlockIndexEntry, BlockStatus};
 use crate::consensus::spec;
 
 /// Maximum size of a single block file before rolling over to a new one.
@@ -46,8 +51,13 @@ impl BlockStore {
     ///
     /// The block is written to the current file. If the file would exceed
     /// `MAX_BLOCKFILE_SIZE`, a new file is started. The block index is
-    /// updated with the file number and offset.
-    pub fn write_block(&self, block: &Block) -> Result<(), String> {
+    /// updated with the file number, offset, height, previous hash,
+    /// chainwork, and status.
+    ///
+    /// The status is passed in by the caller because the store does not
+    /// know whether the block belongs to the active chain or to a side
+    /// branch. The active chain selection lives in the sync layer.
+    pub fn write_block(&self, block: &Block, status: BlockStatus) -> Result<(), String> {
         if self.index.contains(&block.hash) {
             return Ok(());
         }
@@ -59,10 +69,43 @@ impl BlockStore {
         let (file_number, offset) = self.append_to_file(&magic, size, &encoded)?;
 
         self.index
-            .insert(&block.hash, file_number, offset, block.index)
+            .insert(
+                &block.hash,
+                file_number,
+                offset,
+                block.index,
+                &block.previous_hash,
+                block.chainwork,
+                status,
+            )
             .map_err(|e| format!("failed to update block index: {}", e))?;
 
         Ok(())
+    }
+
+    /// Update the status of an already stored block.
+    pub fn set_status(&self, hash: &str, status: BlockStatus) -> Result<(), String> {
+        self.index.update_status(hash, status)
+    }
+
+    /// Return the block index entry for the given hash, if present.
+    pub fn get_entry(&self, hash: &str) -> Result<Option<BlockIndexEntry>, String> {
+        self.index.get(hash)
+    }
+
+    /// Return every entry in the index.
+    pub fn all_entries(&self) -> Result<Vec<BlockIndexEntry>, String> {
+        self.index.all_entries()
+    }
+
+    /// Return every entry whose status is `Active`.
+    pub fn all_active(&self) -> Result<Vec<BlockIndexEntry>, String> {
+        self.index.all_active()
+    }
+
+    /// Return every entry whose status is `ValidFork`.
+    pub fn all_valid_forks(&self) -> Result<Vec<BlockIndexEntry>, String> {
+        self.index.all_valid_forks()
     }
 
     fn append_to_file(
@@ -125,16 +168,16 @@ impl BlockStore {
 
     /// Read a block from disk using the index.
     pub fn read_block(&self, hash: &str) -> Result<Option<Block>, String> {
-        let (file_number, offset) = match self.index.get(hash)? {
-            Some(v) => v,
+        let entry = match self.index.get(hash)? {
+            Some(e) => e,
             None => return Ok(None),
         };
 
-        let path = self.block_file_path(file_number);
+        let path = self.block_file_path(entry.file_number);
         let mut file = File::open(&path)
             .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
 
-        file.seek(SeekFrom::Start(offset))
+        file.seek(SeekFrom::Start(entry.offset))
             .map_err(|e| e.to_string())?;
 
         let mut magic = [0u8; 4];
@@ -151,18 +194,34 @@ impl BlockStore {
         Ok(Some(block))
     }
 
-    /// Iterate over all blocks in order of height using the index.
+    /// Iterate over every block on the active chain, in height order.
+    ///
+    /// Side branches are skipped. The order is determined by the `index`
+    /// field of each block, not by the order of the index iteration.
     pub fn all_blocks(&self) -> Result<Vec<Block>, String> {
-        let entries = self.index.all_entries()?;
-        let mut sorted: Vec<(String, u32, u64, u64)> = entries;
-        sorted.sort_by_key(|(_, _, _, height)| *height);
+        let entries = self.all_active()?;
+        let mut sorted: Vec<BlockIndexEntry> = entries;
+        sorted.sort_by_key(|e| e.height);
 
         let mut blocks = Vec::with_capacity(sorted.len());
-        for (hash, _, _, _) in sorted {
-            if let Some(block) = self.read_block(&hash)? {
+        for entry in sorted {
+            if let Some(block) = self.read_block(&entry.hash)? {
                 blocks.push(block);
             }
         }
         Ok(blocks)
+    }
+
+    /// Iterate over every block in the index, on the active chain or on
+    /// a side branch, in no particular order.
+    pub fn all_blocks_all_branches(&self) -> Result<Vec<(BlockIndexEntry, Block)>, String> {
+        let entries = self.all_entries()?;
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(block) = self.read_block(&entry.hash)? {
+                out.push((entry, block));
+            }
+        }
+        Ok(out)
     }
 }

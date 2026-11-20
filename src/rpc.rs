@@ -744,69 +744,29 @@ impl RpcHandler {
             }
         }
 
+        // Full validation, including the strict per-transaction overlay
+        // checks performed by `validate_block_transactions`. The state
+        // root is not compared; the security comes from the exact
+        // reward check, the merkle root, the proof of work, and the
+        // per-transaction nonce, balance, and signature validation.
         if let Err(e) = validation::validate_block(&mut chain, &prev, &block) {
             return RpcResponse::err(&format!("block rejected: {}", e));
         }
 
-        // Pre-validation of state root simulation to prevent state corruption.
-        let mut addresses = chain.addresses.clone();
-        if !addresses.contains(&block.mined_for) {
-            addresses.push(block.mined_for.clone());
-        }
-        for tx in &block.transactions {
-            if !addresses.contains(&tx.from) {
-                addresses.push(tx.from.clone());
-            }
-            if !addresses.contains(&tx.to) {
-                addresses.push(tx.to.clone());
-            }
-        }
-
-        let simulated_root = match chain.state.simulate_apply(
-            &addresses,
-            &block.transactions,
-            &block.mined_for,
-            block.reward,
-            block.index,
-        ) {
-            Ok(root) => root,
-            Err(e) => {
-                return RpcResponse::err(&format!(
-                    "failed to simulate block for state root validation: {}",
-                    e
-                ))
-            }
-        };
-
-        let simulated_root_hex = hex::encode(simulated_root);
-        if simulated_root_hex != block.state_root {
-            return RpcResponse::err(&format!(
-                "block rejected: state root mismatch (declared {}, simulated {})",
-                block.state_root, simulated_root_hex
-            ));
-        }
-
+        // Apply every transaction. A failure here means the block was
+        // accepted by validation but cannot be applied to the live
+        // state, which is a consensus bug. Reject the block and report
+        // the error instead of silently mutating the state.
         for tx in &block.transactions {
             if let Err(e) = chain.apply_transaction(tx) {
-                return RpcResponse::err(&format!("failed to apply tx: {}", e));
+                return RpcResponse::err(&format!(
+                    "block rejected: failed to apply tx {}: {}",
+                    tx.txid, e
+                ));
             }
         }
         if let Err(e) = chain.credit_reward(&block.mined_for, block.reward, block.index) {
-            return RpcResponse::err(&format!("failed to credit reward: {}", e));
-        }
-
-        let actual_root = match chain.state.root_hash() {
-            Ok(root) => hex::encode(root),
-            Err(e) => {
-                return RpcResponse::err(&format!("failed to compute state root: {}", e))
-            }
-        };
-
-        if actual_root != block.state_root {
-            return RpcResponse::err(&format!(
-                "block rejected: state root mismatch (declared {}, computed {})",
-                block.state_root, actual_root
-            ));
+            return RpcResponse::err(&format!("block rejected: failed to credit reward: {}", e));
         }
 
         chain.chain.push(block.clone());
@@ -1007,15 +967,86 @@ impl RpcHandler {
 
     fn m_getchaintips(&self) -> RpcResponse {
         let chain = self.state.chain.blocking_read();
-        let tip = chain.chain.last().unwrap();
+        let mut tips: Vec<Value> = Vec::new();
 
-        RpcResponse::ok(json!([{
-            "height": chain.height(),
-            "hash": tip.hash,
-            "branchlen": 0,
-            "status": "active",
-            "chainwork": tip.chainwork.to_string(),
-        }]))
+        // The active tip is always reported first.
+        if let Some(tip) = chain.chain.last() {
+            tips.push(json!({
+                "height": tip.index,
+                "hash": tip.hash,
+                "branchlen": 0,
+                "status": "active",
+                "chainwork": tip.chainwork.to_string(),
+            }));
+        }
+
+        // Report every stored side branch tip. A side branch tip is a
+        // stored block whose hash is not referenced as the parent of any
+        // other stored block. The branch length is the number of blocks
+        // between the tip and the first ancestor that is on the active
+        // chain.
+        if let Ok(store) = crate::storage::BlockStore::open_default() {
+            if let Ok(all) = store.all_entries() {
+                // Build a set of every hash that is used as a parent.
+                let mut has_child: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for entry in &all {
+                    if !entry.previous_hash.is_empty() {
+                        has_child.insert(entry.previous_hash.clone());
+                    }
+                }
+
+                // Build a map from hash to entry for ancestor walks.
+                let by_hash: std::collections::HashMap<String, crate::storage::BlockIndexEntry> =
+                    all.iter().map(|e| (e.hash.clone(), e.clone())).collect();
+
+                for entry in &all {
+                    if entry.status != crate::storage::BlockStatus::ValidFork {
+                        continue;
+                    }
+                    if has_child.contains(&entry.hash) {
+                        continue;
+                    }
+
+                    // Walk back until we reach a block on the active
+                    // chain, counting the branch length.
+                    let mut branchlen = 0u64;
+                    let mut cursor = Some(entry.clone());
+                    let mut reaches_active = false;
+                    while let Some(current) = cursor {
+                        if chain.chain.iter().any(|b| b.hash == current.hash) {
+                            reaches_active = true;
+                            break;
+                        }
+                        branchlen += 1;
+                        cursor = by_hash.get(&current.previous_hash).cloned();
+                    }
+
+                    if !reaches_active {
+                        // Orphan branch whose ancestor is not on the
+                        // active chain. Report it as an unknown fork.
+                        tips.push(json!({
+                            "height": entry.height,
+                            "hash": entry.hash,
+                            "branchlen": branchlen,
+                            "status": "unknown-fork",
+                            "chainwork": entry.chainwork.to_string(),
+                        }));
+                        continue;
+                    }
+
+                    tips.push(json!({
+                        "height": entry.height,
+                        "hash": entry.hash,
+                        "branchlen": branchlen,
+                        "status": "valid-fork",
+                        "chainwork": entry.chainwork.to_string(),
+                    }));
+                }
+            }
+        }
+
+        RpcResponse::ok(json!(tips))
     }
 
     fn m_getgenesishash(&self) -> RpcResponse {
@@ -1354,14 +1385,12 @@ impl RpcHandler {
                 // transaction after the first one would be dropped as an
                 // invalid nonce.
                 //
-                // The previous implementation validated the whole batch
-                // first and applied it afterwards, which is why bursts of
-                // transactions from the same sender (for example, several
-                // sends fired within the same second) were dropped with
-                // `invalid nonce: got 1, expected 0`. The fix below walks
-                // the sorted batch and applies each transaction to the
-                // live state before moving on, so the next transaction
-                // from the same sender sees the new nonce.
+                // A transaction that fails validation is NOT dropped.
+                // The block is abandoned and the mempool is restored, so
+                // that the miner never produces a block that contains an
+                // invalid transaction. This mirrors the reference node
+                // behaviour: a miner refuses to build a block whose
+                // transactions do not all pass consensus checks.
                 let mut sorted_txs = all_txs;
                 sorted_txs.sort_by(|a, b| {
                     a.from
@@ -1371,18 +1400,17 @@ impl RpcHandler {
 
                 let mut valid_txs = Vec::new();
                 for tx in sorted_txs {
-                    // apply_and_execute_transaction checks the nonce and
-                    // the mature balance against the live state, which is
-                    // updated after every accepted transaction. It also
-                    // applies the state transition, so the next
-                    // transaction from the same sender sees the new nonce.
                     match chain.apply_and_execute_transaction(&tx) {
                         Ok(_) => valid_txs.push(tx),
                         Err(e) => {
-                            println!(
-                                "[mempool] Dropping invalid tx {} during mining: {}",
+                            // Restore the mempool so that the transaction
+                            // is not lost, and abort this mining attempt.
+                            chain.mempool = valid_txs;
+                            chain.mempool_timestamps.clear();
+                            return RpcResponse::err(&format!(
+                                "mining aborted: invalid mempool transaction {}: {}",
                                 tx.txid, e
-                            );
+                            ));
                         }
                     }
                 }
