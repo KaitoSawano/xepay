@@ -11,6 +11,7 @@ use crate::consensus::spec;
 
 pub const BLOCKS_DIR: &str = "blocks";
 pub const CHAINSTATE_DIR: &str = "chainstate";
+pub const UNDO_DIR: &str = "undo";
 pub const WALLET_FILE: &str = "wallet.dat";
 pub const CONFIG_FILE: &str = "xepay.conf";
 pub const PEERS_FILE: &str = "peers.json";
@@ -36,6 +37,12 @@ pub fn blocks_dir() -> PathBuf {
 }
 pub fn chainstate_dir() -> PathBuf {
     datadir().join(CHAINSTATE_DIR)
+}
+pub fn undo_dir() -> PathBuf {
+    datadir().join(UNDO_DIR)
+}
+pub fn undo_file(height: u64) -> PathBuf {
+    undo_dir().join(format!("rev{:08}.bin", height))
 }
 pub fn state_db_path() -> PathBuf {
     chainstate_dir().join(STATE_DB_DIR)
@@ -75,6 +82,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(blocks_dir())?;
     std::fs::create_dir_all(chainstate_dir())?;
     std::fs::create_dir_all(state_db_path())?;
+    std::fs::create_dir_all(undo_dir())?;
     Ok(())
 }
 
