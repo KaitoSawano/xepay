@@ -859,6 +859,15 @@ fn apply_block_with_undo(chain: &mut Blockchain, block: &Block) -> Result<(), St
     // transition has already been committed to the state database.
     crate::storage::undo::save(&undo)?;
 
+    // Flush the state so that the accounts written by this block are
+    // durable before the next block arrives. Without this flush, a
+    // crash between two blocks would leave the state behind the chain
+    // tip, and the next block would be rejected with a nonce mismatch.
+    chain
+        .state
+        .flush()
+        .map_err(|e| format!("failed to flush state after block {}: {}", block.index, e))?;
+
     Ok(())
 }
 
@@ -908,6 +917,11 @@ fn rollback_to_height(chain: &mut Blockchain, target_height: u64) -> Result<(), 
         let _ = storage::set_block_status(&tip.hash, BlockStatus::ValidFork);
     }
 
+    chain
+        .state
+        .flush()
+        .map_err(|e| format!("failed to flush state after rollback: {}", e))?;
+
     chain.adjust_difficulty();
     Ok(())
 }
@@ -956,6 +970,11 @@ fn rebuild_state_to_height(chain: &mut Blockchain, target_height: u64) -> Result
         }
         chain.state.credit_reward(&block.mined_for, block.reward, block.index)?;
     }
+
+    chain
+        .state
+        .flush()
+        .map_err(|e| format!("failed to flush state after rebuild: {}", e))?;
 
     Ok(())
 }
