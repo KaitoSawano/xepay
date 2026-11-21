@@ -26,7 +26,6 @@ use crate::p2p::message::{BlockLocator, InvType, Inventory, Message};
 use crate::p2p::peer::{ConnectionType, PeerState};
 use crate::p2p::peer_manager::{PeerEvent, PeerManager};
 use crate::p2p::sync::{BlockOutcome, SyncState, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS};
-use crate::storage;
 use crate::utils::{format_datetime, now_millis};
 use crate::validation;
 
@@ -45,6 +44,23 @@ const BASE_BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum stalling timeout after repeated stalling disconnects.
 /// This mirrors the reference node's adaptive cap of 64 seconds.
 const MAX_BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(64);
+
+/// Validation error codes that indicate a state mismatch rather than
+/// misbehavior. A block that fails one of these checks is dropped but
+/// the peer that sent it is not disconnected. The codes are:
+/// - E021: insufficient mature balance
+/// - E022: invalid nonce
+/// - E900: reorganization failed (for example, the side branch is not
+///   consistent with the state that would be rolled back to)
+const STATE_MISMATCH_CODES: &[&str] = &["E021", "E022", "E900"];
+
+/// Return true when orphan-related debug logging is enabled. The
+/// default is off, matching the reference node's behaviour where
+/// orphan events are logged at the debug level and therefore do not
+/// appear in the normal node output.
+fn orphan_debug_enabled() -> bool {
+    std::env::var("XEPAY_DEBUG_ORPHANS").is_ok()
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerInfo {
@@ -1147,32 +1163,60 @@ impl Network {
         }
 
         if headers.len() > MAX_HEADERS_RESULTS as usize {
-            self.punish(id, 20, "too many headers in one message").await;
+            // Too many headers in one message is a protocol violation.
+            // The batch is dropped and the peer is not punished, which
+            // mirrors the reference node's behaviour of ignoring an
+            // oversized header message instead of disconnecting.
+            if orphan_debug_enabled() {
+                println!(
+                    "[p2p] ignoring oversized headers batch from {} ({} headers)",
+                    id,
+                    headers.len()
+                );
+            }
             return;
         }
 
-        let chain = self.chain.read().await;
+        // The first header must connect to a block we already know: the
+        // active chain or the in-memory header chain. If it does not,
+        // the batch is dropped without punishing the peer.
         let first = &headers[0];
-
-        let connects = chain
-            .chain
-            .iter()
-            .any(|b| b.index + 1 == first.index && b.hash == first.previous_hash);
+        let connects = {
+            let chain = self.chain.read().await;
+            chain
+                .chain
+                .iter()
+                .any(|b| b.index + 1 == first.index && b.hash == first.previous_hash)
+                || self
+                    .header_chain
+                    .iter()
+                    .any(|b| b.index + 1 == first.index && b.hash == first.previous_hash)
+        };
         if !connects {
-            drop(chain);
-            self.punish(id, 20, "headers do not connect to any known block")
-                .await;
+            if orphan_debug_enabled() {
+                println!(
+                    "[p2p] ignoring headers batch from {}: first header does not connect",
+                    id
+                );
+            }
             return;
         }
-        drop(chain);
 
-        // The per-block validation in `process_block` already checks the
-        // index sequence, the previous hash, the hash consistency, and the
-        // merkle root. The sequential check on the header batch is
-        // therefore redundant, and disconnecting the peer because a single
-        // header in the batch does not chain to its predecessor would stop
-        // the sync entirely. Every block is validated individually when it
-        // is received.
+        // Every header in the batch must chain to the previous one.
+        // A batch that does not is dropped as a unit, because accepting
+        // a partial batch would create a header chain that cannot be
+        // validated end to end.
+        for window in headers.windows(2) {
+            if window[0].hash != window[1].previous_hash {
+                if orphan_debug_enabled() {
+                    println!(
+                        "[p2p] ignoring headers batch from {}: headers do not chain",
+                        id
+                    );
+                }
+                return;
+            }
+        }
 
         self.sync_state.best_known_height = self.sync_state.best_known_height.max(
             headers.iter().map(|h| h.index).max().unwrap_or(0),
@@ -1193,6 +1237,34 @@ impl Network {
     async fn handle_block(&mut self, id: u64, block: Block) {
         let height = block.index;
         let hash = block.hash.clone();
+
+        // A block is only processed when it was requested through
+        // `getdata`, or when it directly extends the active tip. Any
+        // other unsolicited block is ignored. This mirrors the reference
+        // node's rule that a block is only accepted when it is either
+        // requested or a direct extension of the current tip, and it is
+        // the main reason a healthy node rarely produces orphans.
+        let is_requested = self.sync_state.blocks_requested.contains(&hash);
+        let is_tip_extension = {
+            let chain = self.chain.read().await;
+            chain
+                .chain
+                .last()
+                .map(|b| b.hash == block.previous_hash)
+                .unwrap_or(false)
+        };
+
+        if !is_requested && !is_tip_extension {
+            if orphan_debug_enabled() {
+                println!(
+                    "[p2p] block {} from {} ignored (not requested and not a tip extension)",
+                    height, id
+                );
+            }
+            self.sync_state.received_block(id, &hash, height);
+            self.sync_state.connected_block(&hash);
+            return;
+        }
 
         self.sync_state.received_block(id, &hash, height);
 
@@ -1239,20 +1311,46 @@ impl Network {
                 self.request_blocks_from_peers().await;
             }
             Ok(BlockOutcome::Orphan) => {
-                // An orphan is not misbehavior. Request the missing
-                // parent from the same peer and keep the connection.
-                println!(
-                    "[p2p] block {} from {} is an orphan; requesting its parent",
-                    height, id
-                );
-                self.send_getheaders(id).await;
+                // An orphan is not misbehavior, and it does not need to
+                // be logged at the default level. The reference node
+                // logs orphans at the debug level, so a chain split that
+                // leaves many blocks orphaned does not flood the normal
+                // output. Set XEPAY_DEBUG_ORPHANS=1 to enable the log.
+                if orphan_debug_enabled() {
+                    println!(
+                        "[p2p] block {} from {} is an orphan; keeping it in the orphan pool",
+                        height, id
+                    );
+                }
             }
             Ok(BlockOutcome::Duplicate) => {
                 // Already known. Nothing to do.
             }
+            Ok(BlockOutcome::Invalid { code, message }) => {
+                // The block failed validation. Some failures indicate a
+                // state mismatch (insufficient balance or invalid nonce)
+                // rather than misbehavior, and those are ignored: the
+                // block is dropped and the peer stays connected.
+                if STATE_MISMATCH_CODES.contains(&code) {
+                    println!(
+                        "[p2p] block {} from {} dropped (state mismatch, code {}): {}",
+                        height, id, code, message
+                    );
+                    self.inv.add_block(&hash);
+                    self.sync_state.connected_block(&hash);
+                } else {
+                    self.punish(
+                        id,
+                        50,
+                        &format!("block rejected: [{}] {}", code, message),
+                    )
+                    .await;
+                }
+            }
             Err(e) => {
-                // The block failed validation. The peer is either
-                // malicious or badly broken, so punish it.
+                // An internal error (not a validation failure) is also
+                // treated as misbehavior because it means the block could
+                // not be processed at all.
                 self.punish(id, 50, &format!("block rejected: {}", e)).await;
             }
         }

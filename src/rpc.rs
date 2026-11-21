@@ -648,12 +648,37 @@ impl RpcHandler {
         // The mempool is sorted with the same ordering that the mining
         // path uses so that the simulated state root matches the root
         // produced when the block is actually mined.
+        //
+        // Stale entries (a txid that is already in a block, or a tx
+        // that fails validation against the live state) are skipped
+        // instead of aborting the template. The miner must never
+        // receive a template that contains an invalid tx.
         let mut mempool_snapshot = c.mempool.clone();
         mempool_snapshot.sort_by(|a, b| {
             a.from
                 .cmp(&b.from)
                 .then_with(|| a.nonce.cmp(&b.nonce))
         });
+
+        let mut filtered = Vec::new();
+        for tx in mempool_snapshot {
+            if c.is_txid_in_chain(&tx.txid) {
+                println!(
+                    "[mempool] Skipping tx {}: already included in a block",
+                    tx.txid
+                );
+                continue;
+            }
+            if let Err(e) = validation::validate_transaction(&c, &tx) {
+                println!(
+                    "[mempool] Skipping tx {}: [{}] {}",
+                    tx.txid, e.code, e.message
+                );
+                continue;
+            }
+            filtered.push(tx);
+        }
+        let mempool_snapshot = filtered;
 
         let total_fees: u64 = mempool_snapshot.iter().map(|tx| tx.fee).sum();
         let reward = match subsidy.checked_add(total_fees) {
@@ -1385,12 +1410,13 @@ impl RpcHandler {
                 // transaction after the first one would be dropped as an
                 // invalid nonce.
                 //
-                // A transaction that fails validation is NOT dropped.
-                // The block is abandoned and the mempool is restored, so
-                // that the miner never produces a block that contains an
-                // invalid transaction. This mirrors the reference node
-                // behaviour: a miner refuses to build a block whose
-                // transactions do not all pass consensus checks.
+                // A transaction that is already included in a block, or
+                // that fails validation against the overlay that has
+                // been built so far, is skipped instead of aborting the
+                // mining attempt. This mirrors the reference node
+                // behaviour: a miner refuses to build a block that
+                // contains an invalid transaction, but a stale mempool
+                // entry is not a reason to stop mining.
                 let mut sorted_txs = all_txs;
                 sorted_txs.sort_by(|a, b| {
                     a.from
@@ -1400,19 +1426,28 @@ impl RpcHandler {
 
                 let mut valid_txs = Vec::new();
                 for tx in sorted_txs {
-                    match chain.apply_and_execute_transaction(&tx) {
-                        Ok(_) => valid_txs.push(tx),
-                        Err(e) => {
-                            // Restore the mempool so that the transaction
-                            // is not lost, and abort this mining attempt.
-                            chain.mempool = valid_txs;
-                            chain.mempool_timestamps.clear();
-                            return RpcResponse::err(&format!(
-                                "mining aborted: invalid mempool transaction {}: {}",
-                                tx.txid, e
-                            ));
-                        }
+                    if chain.is_txid_in_chain(&tx.txid) {
+                        println!(
+                            "[mempool] Skipping tx {}: already included in a block",
+                            tx.txid
+                        );
+                        continue;
                     }
+                    if let Err(e) = validation::validate_transaction(&chain, &tx) {
+                        println!(
+                            "[mempool] Skipping tx {}: [{}] {}",
+                            tx.txid, e.code, e.message
+                        );
+                        continue;
+                    }
+                    if let Err(e) = chain.apply_and_execute_transaction(&tx) {
+                        println!(
+                            "[mempool] Skipping tx {}: {}",
+                            tx.txid, e
+                        );
+                        continue;
+                    }
+                    valid_txs.push(tx);
                 }
 
                 let total_fees = valid_txs.iter().map(|tx| tx.fee).sum::<u64>();

@@ -45,6 +45,7 @@ pub fn set_block_status(hash: &str, status: BlockStatus) -> Result<(), String> {
         .map_err(|e| format!("failed to open block store: {}", e))?;
     store.set_status(hash, status)
         .map_err(|e| format!("failed to update block status: {}", e))?;
+    Ok(())
 }
 
 pub use crate::storage_legacy::*;

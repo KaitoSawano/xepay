@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::block::Block;
 use crate::blockchain::Blockchain;
+use crate::consensus::spec::DIFFICULTY_ADJUST_INTERVAL;
 use crate::storage::{self, BlockStatus};
 use crate::validation;
 
@@ -62,6 +63,12 @@ pub const BLOCK_DOWNLOAD_WINDOW: u64 = 1024;
 /// Maximum number of orphans kept in memory. The pool is pruned in FIFO
 /// order when it exceeds this limit.
 pub const MAX_ORPHAN_BLOCKS: usize = 100;
+
+/// Maximum age of an orphan block. Orphans older than this are pruned
+/// from the pool on every insertion. This mirrors the reference node's
+/// orphan expiry of 20 minutes and keeps the pool from filling up with
+/// blocks whose parent will never arrive.
+pub const ORPHAN_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 
 /// Maximum number of side chain blocks whose parent is still unknown.
 /// The pool is pruned in FIFO order when it exceeds this limit.
@@ -186,6 +193,11 @@ pub enum BlockOutcome {
     Orphan,
     /// The block was already known.
     Duplicate,
+    /// The block failed validation. The `code` field is the validation
+    /// error code (for example "E021" or "E022") so that the caller can
+    /// decide whether the failure is a misbehavior or a state mismatch
+    /// that should be ignored.
+    Invalid { code: &'static str, message: String },
 }
 
 /// Global synchronization state across all peers.
@@ -206,6 +218,8 @@ pub struct SyncState {
     pub orphan_pool: HashMap<String, OrphanBlock>,
     /// Insertion order of the orphan pool, used for FIFO pruning.
     pub orphan_order: VecDeque<String>,
+    /// Insertion time of each orphan, used for age-based pruning.
+    pub orphan_added_at: HashMap<String, Instant>,
     /// Side chain blocks whose parent is not yet known, keyed by hash.
     /// Bounded by `MAX_SIDE_CHAIN_BLOCKS`.
     pub side_chain_pool: HashMap<String, Block>,
@@ -224,6 +238,7 @@ impl SyncState {
             sync_peer: None,
             orphan_pool: HashMap::new(),
             orphan_order: VecDeque::new(),
+            orphan_added_at: HashMap::new(),
             side_chain_pool: HashMap::new(),
             side_chain_order: VecDeque::new(),
         }
@@ -365,16 +380,42 @@ impl SyncState {
         self.blocks_requested.len()
     }
 
+    /// Prune orphans that have been in the pool longer than
+    /// `ORPHAN_MAX_AGE`. This mirrors the reference node's orphan
+    /// expiry and keeps the pool from filling up with blocks whose
+    /// parent will never arrive.
+    pub fn prune_old_orphans(&mut self) {
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+        for (hash, added_at) in &self.orphan_added_at {
+            if now.duration_since(*added_at) > ORPHAN_MAX_AGE {
+                to_remove.push(hash.clone());
+            }
+        }
+        for hash in to_remove {
+            self.orphan_pool.remove(&hash);
+            self.orphan_added_at.remove(&hash);
+        }
+        if !self.orphan_order.is_empty() {
+            let added_at = &self.orphan_added_at;
+            self.orphan_order
+                .retain(|hash| added_at.contains_key(hash));
+        }
+    }
+
     /// Add an orphan block to the pool. If the pool is full, the oldest
-    /// orphan is evicted first. Returns `true` if the block was added,
-    /// `false` if it was already present.
+    /// orphan is evicted first. Orphans older than `ORPHAN_MAX_AGE` are
+    /// pruned before the insertion. Returns `true` if the block was
+    /// added, `false` if it was already present.
     pub fn add_orphan(&mut self, hash: &str, block: Block, from_peer: Option<u64>) -> bool {
         if self.orphan_pool.contains_key(hash) {
             return false;
         }
+        self.prune_old_orphans();
         while self.orphan_pool.len() >= MAX_ORPHAN_BLOCKS {
             if let Some(oldest) = self.orphan_order.pop_front() {
                 self.orphan_pool.remove(&oldest);
+                self.orphan_added_at.remove(&oldest);
             } else {
                 break;
             }
@@ -386,6 +427,7 @@ impl SyncState {
                 from_peer,
             },
         );
+        self.orphan_added_at.insert(hash.to_string(), Instant::now());
         self.orphan_order.push_back(hash.to_string());
         true
     }
@@ -394,21 +436,40 @@ impl SyncState {
     /// caller is expected to connect them in turn, which may reveal
     /// further orphans. This is repeated by the caller until the pool
     /// stops yielding new blocks.
+    ///
+    /// A block is considered known when it is on the active chain, in
+    /// the side chain pool, or in the orphan pool itself. Treating
+    /// orphan parents as known lets a whole chain of orphans be drained
+    /// in a single call once the missing ancestor arrives.
     pub fn take_connectable_orphans(&mut self, chain: &Blockchain) -> Vec<(String, OrphanBlock)> {
+        self.prune_old_orphans();
+
         let mut ready = Vec::new();
         let mut still_pending = VecDeque::new();
+
+        // Collect the hashes of every block that is currently known:
+        // the active chain, the side chain pool, and the orphans that
+        // are about to be processed in this call. An orphan whose parent
+        // is another orphan is therefore connectable in the same pass.
+        let mut known: std::collections::HashSet<String> =
+            chain.chain.iter().map(|b| b.hash.clone()).collect();
+        for hash in self.side_chain_pool.keys() {
+            known.insert(hash.clone());
+        }
+        for hash in self.orphan_pool.keys() {
+            known.insert(hash.clone());
+        }
 
         while let Some(hash) = self.orphan_order.pop_front() {
             let entry = match self.orphan_pool.remove(&hash) {
                 Some(e) => e,
                 None => continue,
             };
-            let parent_known = chain.chain.iter().any(|b| b.hash == entry.block.previous_hash)
-                || self.side_chain_pool.contains_key(&entry.block.previous_hash);
-            if parent_known {
+            if known.contains(&entry.block.previous_hash) {
+                self.orphan_added_at.remove(&hash);
                 ready.push((hash, entry));
             } else {
-                still_pending.push_back(hash);
+                still_pending.push_back(hash.clone());
                 self.orphan_pool.insert(hash, entry);
             }
         }
@@ -470,7 +531,10 @@ impl SyncState {
             // Path 1: the block extends the active tip. Full validation
             // against the tip, then apply to the live state.
             if let Err(e) = validation::validate_block(chain, &prev, &block) {
-                return Err(format!("block {} rejected: {}", block.index, e));
+                return Ok(BlockOutcome::Invalid {
+                    code: e.code,
+                    message: e.message,
+                });
             }
             apply_block_transactions(chain, &block)?;
             chain.chain.push(block.clone());
@@ -482,7 +546,7 @@ impl SyncState {
             let _ = storage::set_block_status(&block.hash, BlockStatus::Active);
 
             // Try to connect any orphans whose parent is now known.
-            drain_orphans(chain, sync_state)?;
+            drain_orphans(chain, sync_state);
 
             return Ok(BlockOutcome::Connected);
         }
@@ -499,20 +563,23 @@ impl SyncState {
             None => {
                 // Path 3: the parent is unknown. Keep the block as an
                 // orphan. This is not misbehavior.
-                sync_state.add_orphan(&block.hash, block, from_peer);
+                let hash = block.hash.clone();
+                sync_state.add_orphan(&hash, block, from_peer);
                 return Ok(BlockOutcome::Orphan);
             }
         };
 
-        // Validate the block against its parent. The active chain may
-        // not contain every ancestor of the parent, so the validation
-        // here is structural: hash consistency, previous hash, index,
-        // version, merkle root, reward, total fees, coinbase, timestamp
-        // sanity, proof of work, and the per-transaction checks against
-        // the live state (which is the best available approximation for
-        // a fork that is not yet active).
-        if let Err(e) = validation::validate_block(chain, &parent, &block) {
-            return Err(format!("block {} rejected: {}", block.index, e));
+        // Validate the block against its parent. The per-transaction
+        // state checks (nonce and mature balance) are intentionally not
+        // run here, because the live state reflects the active tip and
+        // not the side branch. They are re-run in `reorganize` and in
+        // `drain_orphans` right before the block is applied, when the
+        // state has already been rolled back to the ancestor.
+        if let Err(e) = validate_block_structural(chain, &parent, &block) {
+            return Ok(BlockOutcome::Invalid {
+                code: e.code,
+                message: e.message,
+            });
         }
 
         // Compute the total chainwork of the branch that ends at this
@@ -528,15 +595,24 @@ impl SyncState {
 
         if branch_chainwork > active_chainwork {
             // Path 4: the side branch is now heavier. Reorganize.
-            sync_state.add_side_chain_block(&block.hash, block.clone());
-            reorganize(chain, sync_state)?;
-            return Ok(BlockOutcome::Reorganized);
+            let hash = block.hash.clone();
+            sync_state.add_side_chain_block(&hash, block.clone());
+            match reorganize(chain, sync_state) {
+                Ok(_) => return Ok(BlockOutcome::Reorganized),
+                Err(e) => {
+                    return Ok(BlockOutcome::Invalid {
+                        code: "E900",
+                        message: format!("reorganization failed: {}", e),
+                    })
+                }
+            }
         }
 
         // Path 5: the side branch is still lighter. Keep the block in
         // the side chain pool so that it can be connected later if the
         // branch grows.
-        sync_state.add_side_chain_block(&block.hash, block);
+        let hash = block.hash.clone();
+        sync_state.add_side_chain_block(&hash, block);
         Ok(BlockOutcome::SideChain)
     }
 
@@ -623,6 +699,18 @@ impl SyncState {
 
         chain.chain.truncate((ancestor_index + 1) as usize);
 
+        // The state now reflects the ancestor. Run the per-transaction
+        // state checks against this state before applying the new block.
+        if let Err(e) =
+            validation::validate_block_transactions(chain, &new_block.transactions, new_block.index)
+        {
+            // Restore the original chain and state if validation failed.
+            chain.chain.truncate((ancestor_index + 1) as usize);
+            chain.chain.extend(rollback_blocks.iter().cloned());
+            let _ = chain.state.rollback_to(&tip_root);
+            return Err(format!("reorg block {} rejected: {}", new_block.index, e));
+        }
+
         if let Err(e) = apply_block_transactions(chain, &new_block) {
             // Restore the original chain and state if applying the new
             // block failed after the rollback.
@@ -674,6 +762,64 @@ impl SyncState {
     }
 }
 
+/// Validate every consensus rule that does not depend on the live state
+/// of the active chain. This is the validation that a side-branch block
+/// receives before it is stored in the side chain pool. The per-tx
+/// nonce and mature-balance checks are intentionally excluded, because
+/// they depend on the state of the branch, not on the state of the
+/// active tip. They are re-run in `reorganize` and in `drain_orphans`
+/// immediately before the block is applied.
+fn validate_block_structural(
+    chain: &Blockchain,
+    parent: &Block,
+    block: &Block,
+) -> Result<(), validation::ValidationError> {
+    validation::rule_block_version(block)?;
+    validation::rule_block_index_sequential(parent, block)?;
+    validation::rule_block_hash_consistent(block)?;
+    validation::rule_block_previous_hash(parent, block)?;
+    validation::rule_block_merkle_root(block)?;
+    validation::rule_block_subsidy(block)?;
+    validation::rule_block_total_fees(block)?;
+    validation::rule_block_reward(block)?;
+    validation::rule_block_coinbase_consistent(block)?;
+    validation::rule_mined_for_valid(block, chain)?;
+    validation::rule_block_state_root_nonempty(block)?;
+    validation::rule_block_pow(block)?;
+    validation::rule_block_tx_count(block)?;
+    validation::rule_block_timestamp_monotonic(parent, block)?;
+    validation::rule_block_checkpoint(block)?;
+    validation::rule_block_chainwork(parent, block)?;
+
+    // The nbits of a side-branch block must match its parent, except at
+    // an adjustment boundary where the nbits changes after the parent is
+    // pushed. At a boundary, the child would need the nbits produced by
+    // applying the adjustment to the view ending at the parent, which
+    // is not available here. Reject the block instead of accepting an
+    // unverified nbits.
+    if parent.index != 0 && parent.index % DIFFICULTY_ADJUST_INTERVAL == 0 {
+        return Err(validation::ValidationError::new(
+            "E901",
+            format!(
+                "block {} extends an adjustment boundary at height {}; \
+                 side-branch nbits at a boundary is not supported",
+                block.index, parent.index
+            ),
+        ));
+    }
+    if block.nbits != parent.nbits {
+        return Err(validation::ValidationError::new(
+            "E902",
+            format!(
+                "block {} nbits {:#010x} does not match parent nbits {:#010x}",
+                block.index, block.nbits, parent.nbits
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Apply a block's transactions and reward to the live chain state.
 ///
 /// The caller must ensure that the block has already been validated
@@ -700,16 +846,36 @@ fn apply_block_transactions(chain: &mut Blockchain, block: &Block) -> Result<(),
     Ok(())
 }
 
+/// Return true when orphan-related debug logging is enabled. The
+/// default is off, matching the reference node's behaviour where
+/// orphan events are logged at the debug level and therefore do not
+/// appear in the normal node output.
+fn orphan_debug_enabled() -> bool {
+    std::env::var("XEPAY_DEBUG_ORPHANS").is_ok()
+}
+
 /// Repeatedly connect orphan blocks whose parent is now known.
 ///
 /// Each successful connection can reveal more orphans, so the loop runs
 /// until no more orphans can be connected. The caller does not need to
 /// know how many orphans were drained.
-fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), String> {
+///
+/// A single orphan that fails validation or fails to apply is dropped
+/// from the pool and logged, but the peer that sent it is not punished
+/// and the loop continues with the remaining orphans. This mirrors the
+/// reference node's behaviour: an orphan is not misbehavior, and a
+/// side-branch block whose state checks fail against the wrong state is
+/// not a reason to disconnect a peer.
+///
+/// Orphan logging is disabled by default so that a chain split that
+/// leaves many blocks orphaned does not flood the node output. Set
+/// `XEPAY_DEBUG_ORPHANS=1` to enable it.
+fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) {
+    let debug = orphan_debug_enabled();
     loop {
         let ready = sync_state.take_connectable_orphans(chain);
         if ready.is_empty() {
-            return Ok(());
+            return;
         }
         for (hash, orphan) in ready {
             let parent = chain
@@ -727,17 +893,50 @@ fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(
                     continue;
                 }
             };
-            if let Err(e) = validation::validate_block(chain, &parent, &orphan.block) {
+            if let Err(e) = validate_block_structural(chain, &parent, &orphan.block) {
                 // The orphan was validated as a structural unit, but
-                // its parent may have changed. Drop it.
-                eprintln!(
-                    "[p2p] dropping orphan {} after validation failure: {}",
-                    hash, e
-                );
+                // its parent may have changed. Drop it without
+                // punishing the peer that sent it.
+                if debug {
+                    eprintln!(
+                        "[p2p] dropping orphan {} after validation failure: [{}] {}",
+                        hash, e.code, e.message
+                    );
+                }
                 continue;
             }
             if orphan.block.previous_hash == chain.chain.last().unwrap().hash {
-                apply_block_transactions(chain, &orphan.block)?;
+                // The orphan extends the active tip. Run the
+                // per-transaction state checks against the live state
+                // before applying, because the state now reflects the
+                // parent of the orphan.
+                if let Err(e) = validation::validate_block_transactions(
+                    chain,
+                    &orphan.block.transactions,
+                    orphan.block.index,
+                ) {
+                    if debug {
+                        eprintln!(
+                            "[p2p] dropping orphan {} after state validation failure: [{}] {}",
+                            hash, e.code, e.message
+                        );
+                    }
+                    continue;
+                }
+                if let Err(e) = apply_block_transactions(chain, &orphan.block) {
+                    // Applying the orphan failed. The state may have
+                    // been partially mutated, so the orphan is dropped
+                    // and the loop continues. The peer is not punished
+                    // because a failure at this point is not proof of
+                    // misbehavior.
+                    if debug {
+                        eprintln!(
+                            "[p2p] dropping orphan {} after apply failure: {}",
+                            hash, e
+                        );
+                    }
+                    continue;
+                }
                 chain.chain.push(orphan.block.clone());
                 chain.adjust_difficulty();
                 let _ = storage::save_block_only(&orphan.block);
@@ -757,6 +956,13 @@ fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(
 /// ancestor with the side branch, rolls the state back to the ancestor,
 /// applies every block on the side branch in order, and demotes the old
 /// active blocks to `ValidFork`.
+///
+/// If applying the new branch fails (for example because the side
+/// branch is not consistent with the state that would be rolled back
+/// to), the original chain and state are restored, the side chain pool
+/// is cleared so that the same reorganization is not attempted again on
+/// every subsequent block, and an error is returned. The caller maps
+/// that error to a state mismatch, which does not disconnect the peer.
 fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), String> {
     // Pick the side branch tip with the highest chainwork.
     let mut best: Option<Block> = None;
@@ -783,7 +989,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
             break;
         }
         if chain.chain.iter().any(|b| b.hash == current.previous_hash) {
-            ancestor_hash = Some(current.previous_hash);
+            ancestor_hash = Some(current.previous_hash.clone());
             new_branch.push(current);
             break;
         }
@@ -818,6 +1024,20 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
     let mut ancestor_root = [0u8; 32];
     ancestor_root.copy_from_slice(&root_bytes);
 
+    let tip_root_hex = match chain.chain.last() {
+        Some(t) => t.state_root.clone(),
+        None => return Err("reorganize: chain has no tip".into()),
+    };
+    let tip_root_bytes = hex::decode(&tip_root_hex)
+        .map_err(|e| format!("reorganize: invalid tip state root hex: {}", e))?;
+    if tip_root_bytes.len() != 32 {
+        return Err("reorganize: tip state root must be 32 bytes".into());
+    }
+    let mut tip_root = [0u8; 32];
+    tip_root.copy_from_slice(&tip_root_bytes);
+
+    let original_chain = chain.chain.clone();
+
     chain.state
         .rollback_to(&ancestor_root)
         .map_err(|e| format!("reorganize: state rollback failed: {}", e))?;
@@ -831,7 +1051,37 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
 
     // Apply the new branch.
     for block in &new_branch {
-        apply_block_transactions(chain, block)?;
+        // The state now reflects the parent of this block, so the
+        // per-transaction state checks (nonce and mature balance) can
+        // be run here against the correct state.
+        if let Err(e) =
+            validation::validate_block_transactions(chain, &block.transactions, block.index)
+        {
+            // The side branch is not consistent with the state that
+            // was rolled back to. Restore the original chain and state
+            // so that the node keeps operating on the active chain,
+            // then drop every block of the side branch from the pool
+            // so that the same reorganization is not attempted again
+            // on every subsequent block.
+            chain.chain = original_chain;
+            let _ = chain.state.rollback_to(&tip_root);
+            sync_state.side_chain_pool.clear();
+            sync_state.side_chain_order.clear();
+            return Err(format!(
+                "reorg block {} rejected: [{}] {}",
+                block.index, e.code, e.message
+            ));
+        }
+        if let Err(e) = apply_block_transactions(chain, block) {
+            chain.chain = original_chain;
+            let _ = chain.state.rollback_to(&tip_root);
+            sync_state.side_chain_pool.clear();
+            sync_state.side_chain_order.clear();
+            return Err(format!(
+                "failed to apply block {} after reorg: {}",
+                block.index, e
+            ));
+        }
         chain.chain.push(block.clone());
         chain.adjust_difficulty();
         let _ = storage::set_block_status(&block.hash, BlockStatus::Active);

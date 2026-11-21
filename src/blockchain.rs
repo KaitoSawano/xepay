@@ -419,6 +419,24 @@ impl Blockchain {
         }
     }
 
+    /// Return true if the given txid is already included in any block of
+    /// the active chain. This is used by `add_transaction` to reject a
+    /// transaction that was already mined, even when the mempool no
+    /// longer contains it.
+    pub fn is_txid_in_chain(&self, txid: &str) -> bool {
+        for block in &self.chain {
+            if block.coinbase_txid == txid {
+                return true;
+            }
+            for tx in &block.transactions {
+                if tx.txid == txid {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn apply_and_execute_transaction(&mut self, tx: &Transaction) -> Result<(), String> {
         if validation::is_special_tx(tx) {
             return Ok(());
@@ -561,6 +579,19 @@ impl Blockchain {
     pub fn add_transaction(&mut self, tx: Transaction) -> bool {
         self.evict_expired_transactions();
 
+        // Reject a transaction that was already mined, even when the
+        // mempool no longer contains it. Without this check, a peer that
+        // rebroadcasts an old transaction would put it back into the
+        // mempool, and the next mining attempt would fail because the
+        // state nonce has already moved past the transaction nonce.
+        if self.is_txid_in_chain(&tx.txid) {
+            println!(
+                "[mempool] Rejected tx {}: already included in a block",
+                tx.txid
+            );
+            return false;
+        }
+
         if self.mempool.iter().any(|t| t.txid == tx.txid) {
             return false;
         }
@@ -634,11 +665,55 @@ impl Blockchain {
         true
     }
 
+    /// Build the next block from the mempool. Every transaction is
+    /// validated against an overlay that starts from the live state and
+    /// is updated as each transaction is applied. This makes the
+    /// selection robust to a mempool that contains a transaction whose
+    /// txid is already in the chain, or whose nonce has already been
+    /// consumed by a previous block. Such a transaction is skipped
+    /// instead of aborting the whole mining attempt.
     pub fn mine_pending(&mut self) -> Result<u64, String> {
         let prev = self.chain.last().unwrap().clone();
         let next_index = prev.index + 1;
         let subsidy = Self::calculate_reward(next_index);
-        let total_fees: u64 = self.mempool.iter().map(|tx| tx.fee).sum();
+
+        let txs = std::mem::take(&mut self.mempool);
+        self.mempool_timestamps.clear();
+
+        let mut sorted_txs = txs;
+        sorted_txs.sort_by(|a, b| {
+            a.from
+                .cmp(&b.from)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+
+        let mut valid_txs = Vec::new();
+        for tx in sorted_txs {
+            if self.is_txid_in_chain(&tx.txid) {
+                println!(
+                    "[mempool] Skipping tx {}: already included in a block",
+                    tx.txid
+                );
+                continue;
+            }
+            if let Err(e) = validation::validate_transaction(self, &tx) {
+                println!(
+                    "[mempool] Skipping tx {}: [{}] {}",
+                    tx.txid, e.code, e.message
+                );
+                continue;
+            }
+            if let Err(e) = self.apply_and_execute_transaction(&tx) {
+                println!(
+                    "[mempool] Skipping tx {}: {}",
+                    tx.txid, e
+                );
+                continue;
+            }
+            valid_txs.push(tx);
+        }
+
+        let total_fees: u64 = valid_txs.iter().map(|tx| tx.fee).sum();
 
         let reward = subsidy
             .checked_add(total_fees)
@@ -651,38 +726,6 @@ impl Blockchain {
         if new_supply > spec::MAX_SUPPLY {
             return Err("max supply reached".into());
         }
-
-        let txs = std::mem::take(&mut self.mempool);
-        self.mempool_timestamps.clear();
-
-        // Order the transactions so that every sender's nonces are
-        // processed in ascending order. Without this sort, a batch of
-        // transactions from the same sender would be validated against
-        // the pre-batch nonce, and every transaction after the first one
-        // would be dropped as an invalid nonce.
-        let mut sorted_txs = txs;
-        sorted_txs.sort_by(|a, b| {
-            a.from
-                .cmp(&b.from)
-                .then_with(|| a.nonce.cmp(&b.nonce))
-        });
-
-        let mut valid_txs = Vec::new();
-        for tx in sorted_txs {
-            if let Err(e) = validation::validate_transaction(self, &tx) {
-                // Restore the mempool so that the remaining transactions
-                // are not lost, and abort the mining attempt. A miner
-                // must never produce a block that contains a transaction
-                // that fails consensus validation.
-                self.mempool = valid_txs;
-                self.mempool.push(tx);
-                return Err(format!("mempool transaction failed validation: {}", e));
-            }
-            self.apply_and_execute_transaction(&tx)?;
-            valid_txs.push(tx);
-        }
-
-        let total_fees: u64 = valid_txs.iter().map(|tx| tx.fee).sum();
 
         self.credit_reward(&prev.mined_for, reward, next_index)?;
 
