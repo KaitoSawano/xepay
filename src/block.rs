@@ -25,7 +25,6 @@ pub struct Block {
     pub mined_for: String,
     pub previous_hash: String,
     pub merkle_root: String,
-    pub state_root: String,
     pub hash: String,
     pub nonce: u64,
     pub nbits: u32,
@@ -124,7 +123,6 @@ impl Block {
             nbits,
             transactions,
             String::new(),
-            String::new(),
             0,
         )
     }
@@ -137,7 +135,6 @@ impl Block {
         nbits: u32,
         transactions: Vec<Transaction>,
         mined_for: String,
-        state_root: String,
         previous_chainwork: u128,
     ) -> Result<Self, String> {
         let ts = now_millis();
@@ -168,7 +165,6 @@ impl Block {
             mined_for,
             previous_hash,
             merkle_root,
-            state_root,
             hash: String::new(),
             nonce: 0,
             nbits,
@@ -226,7 +222,6 @@ impl Block {
             mined_for: "GENESIS".to_string(),
             previous_hash: "0".repeat(64),
             merkle_root,
-            state_root: String::new(),
             hash: String::new(),
             nonce: 0,
             nbits,
@@ -335,7 +330,6 @@ impl Block {
             mined_for: "GENESIS".to_string(),
             previous_hash: "0".repeat(64),
             merkle_root,
-            state_root: String::new(),
             hash,
             nonce,
             nbits,
@@ -365,9 +359,7 @@ impl Block {
         payload.push(0);
         payload.extend_from_slice(self.previous_hash.as_bytes());
         payload.push(0);
-        payload.extend_from_slice(self.merkle_root.as_bytes());
-        payload.push(0);
-        payload.extend_from_slice(self.state_root.as_bytes());
+        payload.extend_from_slice(&self.merkle_root.as_bytes());
         payload.push(0);
         payload.extend_from_slice(&self.nonce.to_be_bytes());
         payload.extend_from_slice(&self.nbits.to_be_bytes());

@@ -46,7 +46,7 @@ pub const GENESIS_TIMESTAMP: u128 = 1794733780684;
 // GENESIS_OUTPUT_SCRIPT or the signature algorithm. Run `xepay-genesis`
 // and paste the output here.
 pub const EXPECTED_GENESIS_HASH: &str =
-    "00000fe6609fb67947daa18ae0347f775c4b0ca61e571027588806e648c2d587";
+    "000003a11070c420c5ad794b67a50b34c3ef77da848dfb96d4a612d7ce7d2e55";
 
 // The expected mainnet genesis merkle root.
 pub const EXPECTED_GENESIS_MERKLE_ROOT: &str =
@@ -56,7 +56,7 @@ pub const EXPECTED_GENESIS_MERKLE_ROOT: &str =
 pub const EXPECTED_GENESIS_TIMESTAMP: u128 = 1794733780684;
 
 // The expected mainnet genesis nonce.
-pub const EXPECTED_GENESIS_NONCE: u64 = 90491;
+pub const EXPECTED_GENESIS_NONCE: u64 = 5097999;
 
 // ----------------------------------------------------------------------
 // Testnet genesis

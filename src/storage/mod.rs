@@ -5,7 +5,6 @@
 //! Storage layer for XEPAY.
 
 pub mod account;
-pub mod adapter;
 pub mod state;
 pub mod block_store;
 pub mod block_index;
@@ -15,8 +14,8 @@ pub use state::StateDB;
 pub use block_store::BlockStore;
 pub use block_index::{BlockIndex, BlockIndexEntry, BlockStatus};
 
-// Fungsi khusus buat P2P: Cuma nulis block ke disk, nggak nulis state.
-// Ini biar P2P nggak ganggu proses Mining.
+// P2P-only helper: write the block to disk without touching the state.
+// This keeps P2P from interfering with the mining process.
 pub fn save_block_only(block: &crate::block::Block) -> Result<(), String> {
     let store = BlockStore::open_default()
         .map_err(|e| format!("failed to open block store: {}", e))?;

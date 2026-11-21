@@ -2,23 +2,29 @@
 // Distributed under the Apache License, see the accompanying
 // file LICENSE or https://www.apache.org/licenses/LICENSE-2.0.
 
-//! State database using a Merkle Patricia Trie backed by LevelDB.
+//! Flat key-value state database backed by LevelDB.
+//!
+//! Each account is stored under its address bytes. The value is the RLP
+//! encoding of the account. There is no trie and no state root: the
+//! block header does not commit to a state root, and the node does not
+//! compare a computed root against a declared one. This mirrors the
+//! design of account-based chains that keep the state as a plain
+//! key-value store and rely on full block validation instead of a state
+//! commitment.
 
-use alloy_primitives::B256;
-use eth_trie::{EthTrie, Trie, DB};
-use keccak_hash::keccak;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+
+use rusty_leveldb::{Options, DB as LevelDB};
 
 use super::account::Account;
-use super::adapter::LevelDbAdapter;
 use crate::consensus::rules;
 
 /// Move every immature reward whose maturity height has been reached into
 /// the spendable balance, and keep the rest in the map. This is the only
-/// place where maturity is resolved, so the live path and the simulation
-/// path cannot disagree about when a reward becomes spendable.
+/// place where maturity is resolved, so the live path and any other
+/// caller cannot disagree about when a reward becomes spendable.
 fn settle_maturity(acc: &mut Account, current_height: u64, maturity: u64) {
     let mut still_immature = BTreeMap::new();
     for (height, amount) in std::mem::take(&mut acc.immature_rewards) {
@@ -34,12 +40,9 @@ fn settle_maturity(acc: &mut Account, current_height: u64, maturity: u64) {
 /// Apply a single transaction to an in-memory account.
 ///
 /// The caller loads the account, calls this function, and stores the
-/// result back into the trie. The function performs no I/O and reads no
-/// global state, so it can be reused by the simulation path without
-/// touching the persistent database. This is the single source of truth
-/// for the state transition, which guarantees that a block accepted by
-/// the live path produces exactly the same state root as the simulation
-/// that validated it.
+/// result back into the database. The function performs no I/O and reads
+/// no global state, so it is the single source of truth for the state
+/// transition.
 fn apply_tx_to_account(
     from_acc: &mut Account,
     to_acc: Option<&mut Account>,
@@ -108,66 +111,33 @@ fn credit_reward_to_account(acc: &mut Account, reward: u64, block_height: u64) {
 }
 
 pub struct StateDB {
-    trie: EthTrie<LevelDbAdapter>,
-    adapter: Arc<LevelDbAdapter>,
-    /// The root hash of the trie after the most recent insertion or
-    /// rollback. The trie implementation does not reliably report the
-    /// current root through `root_hash()` after an insertion, so the
-    /// root is cached here and updated on every mutation.
-    cached_root: B256,
+    db: Mutex<LevelDB>,
 }
 
 impl StateDB {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let adapter = Arc::new(LevelDbAdapter::open(path)?);
-
-        let root_path = crate::datadir::chainstate_dir().join("root_hash.txt");
-        if let Ok(hex_str) = std::fs::read_to_string(&root_path) {
-            let hex_str = hex_str.trim();
-            if let Ok(bytes) = hex::decode(hex_str) {
-                if bytes.len() == 32 {
-                    let root = B256::from_slice(&bytes);
-                    if let Ok(trie) = EthTrie::from(adapter.clone(), root) {
-                        return Ok(StateDB {
-                            trie,
-                            adapter,
-                            cached_root: root,
-                        });
-                    }
-                }
-            }
-        }
-
-        let trie = EthTrie::new(adapter.clone());
-        let cached_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
-        Ok(StateDB {
-            trie,
-            adapter,
-            cached_root,
-        })
+        let mut opt = Options::default();
+        opt.create_if_missing = true;
+        let db = LevelDB::open(path, opt).map_err(|e| format!("{:?}", e))?;
+        Ok(StateDB { db: Mutex::new(db) })
     }
 
-    fn address_key(address: &str) -> [u8; 32] {
-        keccak(address.as_bytes()).0
-    }
-
-    fn recompute_root(&mut self) -> Result<(), String> {
-        let root = self.trie.root_hash().map_err(|e| e.to_string())?;
-        self.cached_root = B256::from_slice(root.as_slice());
-        Ok(())
+    fn address_key(address: &str) -> Vec<u8> {
+        address.as_bytes().to_vec()
     }
 
     pub fn update_account(&mut self, address: &str, account: &Account) -> Result<(), String> {
         let key = Self::address_key(address);
         let value = rlp::encode(account).to_vec();
-        self.trie.insert(&key, &value).map_err(|e| e.to_string())?;
-        self.recompute_root()?;
+        let mut db = self.db.lock().unwrap();
+        db.put(&key, &value).map_err(|e| format!("{:?}", e))?;
         Ok(())
     }
 
     pub fn get_account(&self, address: &str) -> Result<Option<Account>, String> {
         let key = Self::address_key(address);
-        match self.trie.get(&key).map_err(|e| e.to_string())? {
+        let mut db = self.db.lock().unwrap();
+        match db.get(&key) {
             Some(value) => {
                 let account: Account =
                     rlp::decode(&value).map_err(|e| format!("RLP decode error: {}", e))?;
@@ -177,215 +147,19 @@ impl StateDB {
         }
     }
 
-    pub fn root_hash(&mut self) -> Result<[u8; 32], String> {
-        // Recompute the root from the trie on every call to guarantee
-        // that the returned root matches the current state. The cached
-        // root is only a fallback for read-only paths.
-        let root = self.trie.root_hash().map_err(|e| e.to_string())?;
-        self.cached_root = B256::from_slice(root.as_slice());
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(self.cached_root.as_slice());
-        Ok(arr)
-    }
-
-    /// Verify that a trie root is present in the backing database before
-    /// switching to it. Without this check, `EthTrie::from` silently accepts
-    /// an arbitrary root because no node is loaded, and `root_hash` then
-    /// returns the same value even though the database has no data for it.
-    pub fn rollback_to(&mut self, root_hash: &[u8; 32]) -> Result<(), String> {
-        let root = B256::from_slice(root_hash);
-
-        let empty_root = B256::from_slice(keccak_hash::keccak(&[]).as_bytes());
-        if root != empty_root {
-            if self.adapter.get(root.as_slice()).map_err(|e| e.to_string())?.is_none() {
-                return Err(format!(
-                    "state root {} is not present in the database",
-                    hex::encode(root_hash)
-                ));
-            }
+    /// Drop every account from the live state and start from an empty
+    /// database. This is used by the reorg path to rebuild the state from
+    /// the block history after a rollback, because the block header no
+    /// longer commits to a state root and there is no shorter way to
+    /// undo a state transition.
+    pub fn reset(&mut self) -> Result<(), String> {
+        let mut db = self.db.lock().unwrap();
+        let keys = collect_keys(&mut db)?;
+        for key in keys {
+            db.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
-
-        let new_trie = EthTrie::from(self.adapter.clone(), root)
-            .map_err(|e| format!("failed to create trie from root: {}", e))?;
-
-        self.trie = new_trie;
-        self.cached_root = root;
+        db.flush().map_err(|e| format!("{:?}", e))?;
         Ok(())
-    }
-
-    /// Create a temporary snapshot of the current state without modifying
-    /// the original. The snapshot shares the backing database with the
-    /// original, so it must not be used to apply transactions unless the
-    /// caller accepts that the writes reach the shared database. Callers
-    /// that need a read-only simulation must use `simulate_apply` instead.
-    pub fn rollback_snapshot(&mut self) -> Result<StateDB, String> {
-        let root_b256 = self.cached_root;
-
-        let new_trie = EthTrie::from(self.adapter.clone(), root_b256)
-            .map_err(|e| format!("failed to create snapshot trie: {}", e))?;
-
-        Ok(StateDB {
-            trie: new_trie,
-            adapter: self.adapter.clone(),
-            cached_root: root_b256,
-        })
-    }
-
-    /// Simulate applying a list of transactions and crediting the block
-    /// reward, then return the state root that would result. The
-    /// simulation builds an in-memory copy of the current trie from the
-    /// supplied address list, applies the transactions to that copy,
-    /// credits the reward to the miner, and reads the resulting root.
-    /// The persistent database is never written to, so the live state is
-    /// not affected.
-    ///
-    /// The simulation uses the same `settle_maturity`, `apply_tx_to_account`,
-    /// and `credit_reward_to_account` helpers that the live path uses. Any
-    /// divergence between the two paths is a consensus bug, and this
-    /// function exists to make that divergence impossible by construction.
-    ///
-    /// The seed set is the union of the caller-supplied address list, the
-    /// sender and recipient of every transaction in the block, and the
-    /// miner. This makes the simulation independent of whether the caller
-    /// remembered to add those addresses to `addresses`, which is the
-    /// class of bug that caused state root mismatches when a block
-    /// touched an account that was not yet in the local address list.
-    pub fn simulate_apply(
-        &self,
-        addresses: &[String],
-        transactions: &[crate::transaction::Transaction],
-        miner: &str,
-        reward: u64,
-        block_height: u64,
-    ) -> Result<[u8; 32], String> {
-        let memory_db = Arc::new(MemoryDb::new());
-        let mut temp_trie = EthTrie::new(memory_db.clone());
-
-        // Build the seed set from the caller-supplied addresses, the
-        // miner, and every account touched by the transactions in the
-        // block. Duplicates are removed by the BTreeMap.
-        let mut seed_addresses: BTreeMap<String, ()> = BTreeMap::new();
-        for address in addresses {
-            seed_addresses.insert(address.clone(), ());
-        }
-        seed_addresses.insert(miner.to_string(), ());
-        for tx in transactions {
-            if crate::validation::is_special_tx(tx) {
-                continue;
-            }
-            seed_addresses.insert(tx.from.clone(), ());
-            seed_addresses.insert(tx.to.clone(), ());
-        }
-
-        // Seed the simulation trie from the live state for every address
-        // in the seed set. Accounts that do not exist in the live state
-        // are left out, which is correct: they are created by the
-        // simulation itself when the first transaction or reward touches
-        // them, starting from an empty account.
-        for address in seed_addresses.keys() {
-            if let Some(account) = self.get_account(address)? {
-                let key = Self::address_key(address);
-                let value = rlp::encode(&account).to_vec();
-                temp_trie
-                    .insert(&key, &value)
-                    .map_err(|e| format!("failed to seed simulation trie: {}", e))?;
-            }
-        }
-
-        for tx in transactions {
-            if crate::validation::is_special_tx(tx) {
-                continue;
-            }
-
-            let is_message = tx.is_message_tx();
-
-            if tx.from == tx.to {
-                if !is_message || tx.amount != rules::MIN_MESSAGE_AMOUNT {
-                    return Err(format!(
-                        "self-transfer rejected during simulation: {}",
-                        tx.txid
-                    ));
-                }
-            } else if is_message {
-                return Err(format!(
-                    "message transaction must be a self-send: {}",
-                    tx.txid
-                ));
-            }
-
-            if tx.amount == 0 {
-                return Err(format!(
-                    "zero amount rejected during simulation: {}",
-                    tx.txid
-                ));
-            }
-
-            let from_key = Self::address_key(&tx.from);
-            let to_key = Self::address_key(&tx.to);
-
-            let mut from_acc = read_account_from_trie(&mut temp_trie, &from_key)?
-                .unwrap_or_else(empty_account);
-
-            if tx.from == tx.to {
-                apply_tx_to_account(
-                    &mut from_acc,
-                    None,
-                    &tx.from,
-                    &tx.to,
-                    tx.amount,
-                    tx.fee,
-                    tx.nonce,
-                    block_height,
-                )?;
-                let from_value = rlp::encode(&from_acc).to_vec();
-                temp_trie
-                    .insert(&from_key, &from_value)
-                    .map_err(|e| format!("failed to insert sender into simulation: {}", e))?;
-            } else {
-                let mut to_acc = read_account_from_trie(&mut temp_trie, &to_key)?
-                    .unwrap_or_else(empty_account);
-                apply_tx_to_account(
-                    &mut from_acc,
-                    Some(&mut to_acc),
-                    &tx.from,
-                    &tx.to,
-                    tx.amount,
-                    tx.fee,
-                    tx.nonce,
-                    block_height,
-                )?;
-                let from_value = rlp::encode(&from_acc).to_vec();
-                let to_value = rlp::encode(&to_acc).to_vec();
-                temp_trie
-                    .insert(&from_key, &from_value)
-                    .map_err(|e| format!("failed to insert sender into simulation: {}", e))?;
-                temp_trie
-                    .insert(&to_key, &to_value)
-                    .map_err(|e| format!("failed to insert recipient into simulation: {}", e))?;
-            }
-        }
-
-        // Credit the reward with the same helper that the live path uses.
-        // The fee is part of `reward` because the miner receives both the
-        // subsidy and the transaction fees. Maturity is settled before
-        // the new reward is pushed, matching `credit_reward` on the live
-        // path.
-        let miner_key = Self::address_key(miner);
-        let mut miner_acc = read_account_from_trie(&mut temp_trie, &miner_key)?
-            .unwrap_or_else(empty_account);
-        settle_maturity(&mut miner_acc, block_height, rules::COINBASE_MATURITY);
-        credit_reward_to_account(&mut miner_acc, reward, block_height);
-        let miner_value = rlp::encode(&miner_acc).to_vec();
-        temp_trie
-            .insert(&miner_key, &miner_value)
-            .map_err(|e| format!("failed to credit reward in simulation: {}", e))?;
-
-        let root = temp_trie
-            .root_hash()
-            .map_err(|e| format!("failed to compute simulation root: {}", e))?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(root.as_slice());
-        Ok(arr)
     }
 
     /// Return the total balance of an address.
@@ -539,9 +313,8 @@ impl StateDB {
     /// The reward is added to `immature_rewards` and stays there until
     /// it matures. Maturity is resolved lazily by `settle_maturity`,
     /// which is called here before the new reward is pushed so that the
-    /// live path and the simulation path resolve maturity at the same
-    /// point. This keeps `acc.balance` and `acc.immature_rewards`
-    /// consistent between the two paths.
+    /// live path resolves maturity at the same point every time. This
+    /// keeps `acc.balance` and `acc.immature_rewards` consistent.
     pub fn credit_reward(
         &mut self,
         miner: &str,
@@ -555,13 +328,8 @@ impl StateDB {
     }
 
     pub fn flush(&mut self) -> Result<(), String> {
-        // Recompute the root before writing so that root_hash.txt always
-        // reflects the current trie state.
-        self.recompute_root()?;
-        let path = crate::datadir::chainstate_dir().join("root_hash.txt");
-        let _ = std::fs::write(path, hex::encode(self.cached_root));
-
-        self.adapter.flush().map_err(|e| e.to_string())
+        let mut db = self.db.lock().unwrap();
+        db.flush().map_err(|e| format!("{:?}", e))
     }
 }
 
@@ -581,60 +349,13 @@ fn empty_account() -> Account {
     }
 }
 
-fn read_account_from_trie<D: DB>(
-    trie: &mut EthTrie<D>,
-    key: &[u8; 32],
-) -> Result<Option<Account>, String> {
-    match trie.get(key).map_err(|e| format!("trie read failed: {}", e))? {
-        Some(value) => {
-            let account: Account =
-                rlp::decode(&value).map_err(|e| format!("RLP decode error: {}", e))?;
-            Ok(Some(account))
-        }
-        None => Ok(None),
+fn collect_keys(db: &mut LevelDB) -> Result<Vec<Vec<u8>>, String> {
+    use rusty_leveldb::LdbIterator;
+
+    let mut iter = db.new_iter().map_err(|e| format!("{:?}", e))?;
+    let mut keys = Vec::new();
+    while let Some((key, _)) = iter.next() {
+        keys.push(key);
     }
-}
-
-// A minimal in-memory DB implementation used by `simulate_apply` so that
-// the simulation never writes to the persistent LevelDB. A `BTreeMap`
-// is used instead of a `HashMap` so that any internal iteration over
-// the backing store is deterministic. This removes the last source of
-// state root divergence between the live path, which uses the persistent
-// LevelDB adapter, and the simulation path.
-#[derive(Clone, Default)]
-struct MemoryDb {
-    inner: Arc<Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
-}
-
-impl MemoryDb {
-    fn new() -> Self {
-        MemoryDb {
-            inner: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-        }
-    }
-}
-
-impl DB for MemoryDb {
-    type Error = std::io::Error;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        let guard = self.inner.lock().unwrap();
-        Ok(guard.get(key).cloned())
-    }
-
-    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.insert(key.to_vec(), value);
-        Ok(())
-    }
-
-    fn remove(&self, key: &[u8]) -> Result<(), Self::Error> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(key);
-        Ok(())
-    }
-
-    fn flush(&self) -> Result<(), Self::Error> {
-        Ok(())
-    }
+    Ok(keys)
 }

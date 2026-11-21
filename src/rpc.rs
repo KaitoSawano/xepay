@@ -422,7 +422,6 @@ impl RpcHandler {
             "getmempoolinfo" => self.m_getmempoolinfo(),
             "validatemempool" => self.m_validatemempool(),
             "getnonce" => self.m_getnonce(req),
-            "rollbackchain" => self.m_rollbackchain(req),
 
             _ => RpcResponse::err("unknown method"),
         }
@@ -646,8 +645,8 @@ impl RpcHandler {
         };
 
         // The mempool is sorted with the same ordering that the mining
-        // path uses so that the simulated state root matches the root
-        // produced when the block is actually mined.
+        // path uses so that the transactions selected by the miner match
+        // the transactions that would be selected by the node.
         //
         // Stale entries (a txid that is already in a block, or a tx
         // that fails validation against the live state) are skipped
@@ -686,41 +685,11 @@ impl RpcHandler {
             None => return RpcResponse::err("block reward overflow"),
         };
 
-        let mut addresses = c.addresses.clone();
-        if !addresses.contains(&mining_address) {
-            addresses.push(mining_address.clone());
-        }
-        for tx in &mempool_snapshot {
-            if !addresses.contains(&tx.from) {
-                addresses.push(tx.from.clone());
-            }
-            if !addresses.contains(&tx.to) {
-                addresses.push(tx.to.clone());
-            }
-        }
-
-        let state_root = match c.state.simulate_apply(
-            &addresses,
-            &mempool_snapshot,
-            &mining_address,
-            reward,
-            next_height,
-        ) {
-            Ok(root) => hex::encode(root),
-            Err(e) => {
-                return RpcResponse::err(&format!(
-                    "failed to simulate mempool for template: {}",
-                    e
-                ))
-            }
-        };
-
         RpcResponse::ok(json!({
             "height": next_height,
             "previous_hash": prev_hash,
             "previous_chainwork": previous_chainwork.to_string(),
             "nbits": nbits,
-            "state_root": state_root,
             "mining_address": mining_address,
             "reward_xepc": to_coin(reward),
             "reward_ald": to_aldian(reward),
@@ -770,10 +739,10 @@ impl RpcHandler {
         }
 
         // Full validation, including the strict per-transaction overlay
-        // checks performed by `validate_block_transactions`. The state
-        // root is not compared; the security comes from the exact
-        // reward check, the merkle root, the proof of work, and the
-        // per-transaction nonce, balance, and signature validation.
+        // checks performed by `validate_block_transactions`. The security
+        // comes from the exact reward check, the merkle root, the proof
+        // of work, and the per-transaction nonce, balance, and signature
+        // validation.
         if let Err(e) = validation::validate_block(&mut chain, &prev, &block) {
             return RpcResponse::err(&format!("block rejected: {}", e));
         }
@@ -820,7 +789,6 @@ impl RpcHandler {
             "mined_at": block.mined_at,
             "mined_for": block.mined_for,
             "nbits": block.nbits,
-            "state_root": block.state_root,
         }))
     }
 
@@ -919,7 +887,6 @@ impl RpcHandler {
             "hash": block.hash,
             "previous_hash": block.previous_hash,
             "merkle_root": block.merkle_root,
-            "state_root": block.state_root,
             "timestamp": block.timestamp,
             "mined_at": block.mined_at,
             "mined_for": block.mined_for,
@@ -959,7 +926,6 @@ impl RpcHandler {
             "height": block.index,
             "version": block.nversion,
             "merkleroot": block.merkle_root,
-            "state_root": block.state_root,
             "time": block.timestamp,
             "mediantime": block.timestamp,
             "nonce": block.nonce,
@@ -1093,7 +1059,6 @@ impl RpcHandler {
                 "mined_at": g.mined_at,
                 "previous_hash": g.previous_hash,
                 "merkle_root": g.merkle_root,
-                "state_root": g.state_root,
                 "nonce": g.nonce,
                 "nbits": g.nbits,
                 "reward_xepc": to_coin(g.reward),
@@ -1389,7 +1354,6 @@ impl RpcHandler {
                 valid_txs,
                 previous_chainwork,
                 total_fees,
-                state_root,
             ) = {
                 let mut chain = self.state.chain.blocking_write();
                 let prev = chain.chain.last().unwrap().clone();
@@ -1460,13 +1424,6 @@ impl RpcHandler {
                     return RpcResponse::err(&format!("failed to credit reward: {}", e));
                 }
 
-                let state_root = match chain.state.root_hash() {
-                    Ok(root) => hex::encode(root),
-                    Err(e) => {
-                        return RpcResponse::err(&format!("failed to compute state root: {}", e));
-                    }
-                };
-
                 (
                     next_index,
                     prev.hash,
@@ -1475,7 +1432,6 @@ impl RpcHandler {
                     valid_txs,
                     prev.chainwork,
                     total_fees,
-                    state_root,
                 )
             };
 
@@ -1487,7 +1443,6 @@ impl RpcHandler {
                 nbits,
                 valid_txs,
                 addr.clone(),
-                state_root,
                 previous_chainwork,
             ) {
                 Ok(b) => b,
@@ -1560,8 +1515,8 @@ impl RpcHandler {
 
         // Estimate transaction size based on the new raw byte format.
         // 2 inputs (from/to) + amount + fee + nonce + signature + public key + overhead.
-        let estimated_tx_size: u64 = 5_400; 
-        
+        let estimated_tx_size: u64 = 5_400;
+
         let fee: u64 = if let Some(custom) = req.params.get(3).and_then(|v| v.as_u64()) {
             if custom == 0 {
                 return RpcResponse::err("fee must be greater than zero");
@@ -1572,7 +1527,7 @@ impl RpcHandler {
             let mut chain = self.state.chain.blocking_write();
             let dynamic_min_fee_rate = chain.current_min_fee_per_byte();
             drop(chain);
-            
+
             // Calculate fee based on dynamic rate and estimated size
             (dynamic_min_fee_rate * estimated_tx_size).max(DEFAULT_FEE_XEPC)
         };
@@ -1646,7 +1601,7 @@ impl RpcHandler {
             let chain = self.state.chain.blocking_read();
             let height = chain.height();
             let bal = chain.mature_balance_at(&from_address, height);
-            
+
             // FIX: Use checked_sub to prevent underflow if bal <= fee
             match bal.checked_sub(fee) {
                 Some(v) if v > 0 => v,
@@ -2106,144 +2061,6 @@ impl RpcHandler {
             "count": addresses.len(),
             "addresses": addresses,
             "message": "wallet dumped successfully. Keep this data secure.",
-        }))
-    }
-
-    /// Roll the chain back to the given height.
-    ///
-    /// The block at `height` is kept, every block above it is removed,
-    /// and the state is rolled back to the state root committed by that
-    /// block. Transactions from the removed blocks are re-validated
-    /// against the rolled-back state and returned to the mempool when
-    /// they are still valid. This is the tool to use when the chain tip
-    /// is invalid but the earlier history is sound, instead of deleting
-    /// the whole datadir.
-    fn m_rollbackchain(&mut self, req: &RpcRequest) -> RpcResponse {
-        let target_height = match req.params.first().and_then(|v| v.as_u64()) {
-            Some(h) => h,
-            None => return RpcResponse::err("rollbackchain requires a height parameter"),
-        };
-
-        let mut chain = self.state.chain.blocking_write();
-
-        if target_height >= chain.chain.len() as u64 {
-            return RpcResponse::err(&format!(
-                "target height {} is not below the current tip {}",
-                target_height,
-                chain.chain.len() - 1
-            ));
-        }
-
-        if target_height == 0 {
-            return RpcResponse::err(
-                "refusing to roll back to the genesis block; delete the datadir instead",
-            );
-        }
-
-        let target_block = chain.chain[target_height as usize].clone();
-
-        if target_block.state_root.is_empty() {
-            return RpcResponse::err(&format!(
-                "block {} has an empty state root",
-                target_height
-            ));
-        }
-
-        let root_bytes = match hex::decode(&target_block.state_root) {
-            Ok(b) => b,
-            Err(e) => return RpcResponse::err(&format!("invalid state root hex: {}", e)),
-        };
-        if root_bytes.len() != 32 {
-            return RpcResponse::err("state root must be 32 bytes");
-        }
-        let mut root_arr = [0u8; 32];
-        root_arr.copy_from_slice(&root_bytes);
-
-        // Collect the transactions from the blocks that are about to be
-        // removed before truncating the chain.
-        let removed: Vec<crate::block::Block> =
-            chain.chain[(target_height as usize + 1)..].to_vec();
-
-        if let Err(e) = chain.state.rollback_to(&root_arr) {
-            return RpcResponse::err(&format!("state rollback failed: {}", e));
-        }
-
-        chain.chain.truncate(target_height as usize + 1);
-        chain.adjust_difficulty();
-
-        // Rebuild the address list and the mempool from the rolled-back
-        // chain plus the transactions of the removed blocks.
-        let mut addresses = vec!["GENESIS".to_string()];
-        for block in &chain.chain {
-            if !block.mined_for.is_empty() && !addresses.contains(&block.mined_for) {
-                addresses.push(block.mined_for.clone());
-            }
-            for tx in &block.transactions {
-                if crate::validation::is_special_tx(tx) {
-                    continue;
-                }
-                if !addresses.contains(&tx.from) {
-                    addresses.push(tx.from.clone());
-                }
-                if !addresses.contains(&tx.to) {
-                    addresses.push(tx.to.clone());
-                }
-            }
-        }
-        chain.addresses = addresses;
-
-        // Collect the candidate transactions from the removed blocks in
-        // chronological order and sort them by (sender, nonce) before
-        // validating and applying them one by one. This mirrors the
-        // mining path so that a sender's burst of transactions is
-        // validated against the correct nonce sequence.
-        let mut candidates: Vec<crate::transaction::Transaction> = Vec::new();
-        for block in removed.iter() {
-            for tx in &block.transactions {
-                if crate::validation::is_special_tx(tx) {
-                    continue;
-                }
-                candidates.push(tx.clone());
-            }
-        }
-        candidates.sort_by(|a, b| {
-            a.from
-                .cmp(&b.from)
-                .then_with(|| a.nonce.cmp(&b.nonce))
-        });
-
-        let mut new_mempool = Vec::new();
-        let mut mempool_timestamps = std::collections::HashMap::new();
-        for tx in candidates {
-            if crate::validation::validate_transaction(&chain, &tx).is_ok() {
-                new_mempool.push(tx.clone());
-                let now = (crate::utils::now_millis() / 1000) as u64;
-                mempool_timestamps.insert(tx.txid.clone(), now);
-            }
-        }
-        chain.mempool = new_mempool;
-        chain.mempool_timestamps = mempool_timestamps;
-
-        if let Err(e) = storage::save_chain(&mut chain) {
-            return RpcResponse::err(&format!("failed to save rolled-back chain: {}", e));
-        }
-
-        let new_height = chain.height();
-        let new_tip = chain.chain.last().unwrap().hash.clone();
-        let mempool_len = chain.mempool.len();
-        drop(chain);
-
-        println!(
-            "[node] rollbackchain: rolled back to height {} (hash {}), mempool now {} transactions",
-            new_height, new_tip, mempool_len
-        );
-
-        RpcResponse::ok(json!({
-            "rolled_back_to": new_height,
-            "hash": new_tip,
-            "removed_blocks": removed.len(),
-            "mempool_len": mempool_len,
-            "state_root": target_block.state_root,
         }))
     }
 }

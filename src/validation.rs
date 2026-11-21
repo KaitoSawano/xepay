@@ -136,14 +136,14 @@ pub fn rule_message_format(tx: &Transaction) -> Result<(), ValidationError> {
 /// an amount larger than the total supply.
 pub fn rule_money_range(tx: &Transaction) -> Result<(), ValidationError> {
     let max_money = spec::MAX_SUPPLY;
-    
+
     if tx.amount > max_money {
         return Err(ValidationError::new(
             "E005",
             format!("amount {} exceeds MAX_MONEY {}", tx.amount, max_money),
         ));
     }
-    
+
     if tx.fee > max_money {
         return Err(ValidationError::new(
             "E005",
@@ -195,13 +195,13 @@ pub fn rule_signature(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.signature.is_empty() {
         return Err(ValidationError::new("E010", "signature is empty"));
     }
-    
+
     let pk = &tx.public_key;
     let sig = &tx.signature;
-    
+
     let msg = hex::decode(tx.signing_hash())
         .map_err(|_| ValidationError::new("E010", "signing hash is not hexadecimal"))?;
-        
+
     if !verify::verify(pk, &msg, sig) {
         return Err(ValidationError::new(
             "E010",
@@ -218,7 +218,7 @@ pub fn rule_address_matches_pubkey(tx: &Transaction) -> Result<(), ValidationErr
     if tx.public_key.is_empty() {
         return Err(ValidationError::new("E011", "public key is empty"));
     }
-    
+
     let pk = &tx.public_key;
 
     let hrp = crate::blockchain::bech32_hrp();
@@ -346,7 +346,7 @@ pub fn rule_block_reward(block: &Block) -> Result<(), ValidationError> {
     // FIX: Use checked_add to prevent overflow if a miner tries to claim u64::MAX
     let expected = block.subsidy.checked_add(block.total_fees)
         .ok_or_else(|| ValidationError::new("E046", "block reward overflow"))?;
-        
+
     if block.reward != expected {
         return Err(ValidationError::new(
             "E046",
@@ -737,25 +737,6 @@ pub fn validate_block_transactions(
     Ok(())
 }
 
-pub fn rule_block_state_root_nonempty(block: &Block) -> Result<(), ValidationError> {
-    if block.index == 0 {
-        return Ok(());
-    }
-    if block.state_root.is_empty() {
-        return Err(ValidationError::new(
-            "E052",
-            format!("block {} has an empty state root", block.index),
-        ));
-    }
-    if block.state_root.len() != 64 || !block.state_root.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ValidationError::new(
-            "E052",
-            format!("block {} has a malformed state root", block.index),
-        ));
-    }
-    Ok(())
-}
-
 pub fn rule_block_chainwork(prev: &Block, cur: &Block) -> Result<(), ValidationError> {
     let expected_block_work = Block::compute_work(cur.nbits);
     let expected_chainwork = prev.chainwork.saturating_add(expected_block_work);
@@ -786,7 +767,6 @@ pub fn validate_block(
     rule_block_reward(block)?;
     rule_block_coinbase_consistent(block)?;
     rule_mined_for_valid(block, chain)?;
-    rule_block_state_root_nonempty(block)?;
     rule_block_pow(block)?;
     rule_block_tx_count(block)?;
     rule_block_timestamp_monotonic(prev, block)?;
@@ -794,7 +774,7 @@ pub fn validate_block(
     rule_block_nbits(chain, block)?;
     rule_block_chainwork(prev, block)?;
     validate_block_transactions(chain, &block.transactions, block.index)?;
-    
+
     // Verify total supply does not exceed MAX_MONEY after this block
     let new_supply = chain.circulating_supply().checked_add(block.reward)
         .ok_or_else(|| ValidationError::new("E041", "supply overflow"))?;
@@ -905,10 +885,6 @@ pub fn validate_chain(chain: &mut Blockchain) -> Result<(), ValidationError> {
             if !crate::blockchain::checkpoint::verify(cur.index, &cur.hash) {
                 return Err(ValidationError::new("E038",
                     format!("block {} violates a checkpoint", cur_index)));
-            }
-            if cur.state_root.is_empty() || cur.state_root.len() != 64 {
-                return Err(ValidationError::new("E052",
-                    format!("block {} has an empty or malformed state root", cur_index)));
             }
         }
         let expected_subsidy = Blockchain::calculate_reward(cur_index);

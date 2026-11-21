@@ -22,7 +22,8 @@ pub const BLOCKS_PER_FILE: usize = 1000;
 /// Persist the chain to disk.
 ///
 /// The order of operations is important:
-///   1. Flush the state database so that `root_hash.txt` is written.
+///   1. Flush the state database so that every pending write reaches
+///      the backing store.
 ///   2. Save the mempool and state snapshot.
 ///   3. Persist every block that is not yet in the append-only block store.
 ///
@@ -35,7 +36,8 @@ pub const BLOCKS_PER_FILE: usize = 1000;
 pub fn save_chain(chain: &mut Blockchain) -> std::io::Result<()> {
     datadir::ensure_dirs()?;
 
-    // Step 1: flush the state database so that root_hash.txt is written.
+    // Step 1: flush the state database so that every pending write
+    // reaches the backing store.
     chain
         .state
         .flush()
@@ -146,18 +148,6 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
         ));
     }
 
-    // FIX: Force the genesis block's state_root to be empty and recompute
-    // its hash. The genesis block was originally mined with an empty
-    // state_root, and its hash must match EXPECTED_GENESIS_HASH. An older
-    // version of the code accidentally filled in the genesis state_root
-    // after initialization, which made the on-disk hash inconsistent
-    // with the recomputed hash. This fix restores consistency without
-    // requiring a reindex.
-    if let Some(genesis) = blocks.first_mut() {
-        genesis.state_root = String::new();
-        genesis.hash = genesis.calculate_hash();
-    }
-
     // ------------------------------------------------------------------
     // Genesis hash validation
     // ------------------------------------------------------------------
@@ -194,10 +184,6 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
     if reindex_requested {
         eprintln!("[node] Manual reindex requested. Deleting state database...");
         let _ = std::fs::remove_dir_all(&db_path);
-
-        // Delete root_hash.txt so that the trie starts from empty.
-        let root_path = datadir::chainstate_dir().join("root_hash.txt");
-        let _ = std::fs::remove_file(root_path);
     }
 
     let state = crate::storage::StateDB::open(&db_path)
@@ -265,32 +251,58 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
             std::process::exit(1);
         }
 
-        // Flush after reindex so that the root hash is persisted.
+        // Flush after reindex so that every pending write reaches the
+        // backing store.
         if let Err(e) = chain.state.flush() {
             eprintln!("[node] FATAL: Failed to flush state after reindex: {}", e);
             std::process::exit(1);
         }
 
         eprintln!("[node] Reindex successful! State fully rebuilt from blocks.");
-    } else {
-        // Strict verification: the node refuses to start with an
-        // inconsistent state. The caller (AppInit) decides whether to
-        // exit or prompt the user to run with -reindex.
-        if let Err(e) = verify_state_root(&mut chain) {
-            return Err(Error::other(format!(
-                "state root verification failed: {}. \
-                 The state database is corrupted or out of sync. \
-                 Run with -reindex to rebuild the state from the block history.",
-                e
-            )));
+    } else if chain.chain.len() > 1 && is_state_empty(&chain) {
+        // The state database is empty even though the chain has more
+        // than just the genesis block. This happens when the datadir was
+        // created before the flat key-value state store was introduced,
+        // or when the state database was deleted but the block store was
+        // kept. Rebuild the state from the block history so that the
+        // node can start without requiring a manual reindex.
+        eprintln!("[node] State database is empty but the chain is not. Rebuilding state from block history...");
+        if let Err(e) = rebuild_state_from_blocks(&mut chain) {
+            eprintln!("[node] FATAL: State rebuild failed: {}", e);
+            std::process::exit(1);
         }
+        if let Err(e) = chain.state.flush() {
+            eprintln!("[node] FATAL: Failed to flush state after rebuild: {}", e);
+            std::process::exit(1);
+        }
+        eprintln!("[node] State rebuild successful.");
     }
 
     Ok(chain)
 }
 
+/// Return true when the state database contains only the genesis account
+/// and nothing else. This is used to detect a state database that was
+/// deleted or never created while the block store still holds the full
+/// chain.
+fn is_state_empty(chain: &Blockchain) -> bool {
+    match chain.state.get_account("GENESIS") {
+        Ok(Some(acc)) => {
+            acc.nonce == 0
+                && acc.balance == chain.chain[0].reward
+                && acc.immature_rewards.is_empty()
+        }
+        _ => true,
+    }
+}
+
 fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
     let blocks = chain.chain.clone();
+
+    chain
+        .state
+        .reset()
+        .map_err(Error::other)?;
 
     if let Some(genesis_block) = blocks.first() {
         chain.state.update_account(
@@ -335,40 +347,6 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
         "[node] reindex populated {} addresses",
         chain.addresses.len()
     );
-    Ok(())
-}
-
-/// Verify that the state database matches the state root committed in the
-/// tip block. Returns an error if the roots do not match.
-///
-/// This function does NOT call `std::process::exit`. It returns an error
-/// to the caller so that the caller can decide how to handle the
-/// inconsistency (e.g. print a message and exit, or retry with reindex).
-fn verify_state_root(chain: &mut Blockchain) -> std::io::Result<()> {
-    if chain.chain.is_empty() {
-        return Ok(());
-    }
-
-    let tip = chain.chain.last().unwrap();
-
-    if tip.state_root.is_empty() {
-        return Ok(());
-    }
-
-    let current_root = chain
-        .state
-        .root_hash()
-        .map_err(|e| Error::other(format!("failed to compute state root: {}", e)))?;
-
-    let current_root_hex = hex::encode(current_root);
-
-    if current_root_hex != tip.state_root {
-        return Err(Error::other(format!(
-            "state root mismatch at height {}.\nExpected: {}\nGot:      {}",
-            tip.index, tip.state_root, current_root_hex
-        )));
-    }
-
     Ok(())
 }
 

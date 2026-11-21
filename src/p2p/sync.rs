@@ -17,16 +17,15 @@
 //!   the live state until its branch has more total chainwork than the
 //!   active chain.
 //! - When a side branch gains more chainwork than the active chain, a
-//!   reorganization is performed: the state is rolled back to the fork
-//!   point, the old active blocks are demoted to `ValidFork`, the new
-//!   active blocks are promoted to `Active`, and transactions from the
-//!   abandoned branch are returned to the mempool when still valid.
-//! - The state root stored in the block header is kept as an
-//!   informational commitment. It is not compared against a freshly
-//!   simulated root, because the trie implementation is not
-//!   deterministic across backing stores. The security of the chain
-//!   comes from the strict per-transaction validation, the exact reward
-//!   check, the merkle root, the proof of work, and the chainwork.
+//!   reorganization is performed: the state is rebuilt from the block
+//!   history up to the fork point, the old active blocks are demoted to
+//!   `ValidFork`, the new active blocks are promoted to `Active`, and
+//!   transactions from the abandoned branch are returned to the mempool
+//!   when still valid.
+//! - The block header does not commit to a state root. The security of
+//!   the chain comes from the strict per-transaction validation, the
+//!   exact reward check, the merkle root, the proof of work, and the
+//!   chainwork.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -574,7 +573,7 @@ impl SyncState {
         // run here, because the live state reflects the active tip and
         // not the side branch. They are re-run in `reorganize` and in
         // `drain_orphans` right before the block is applied, when the
-        // state has already been rolled back to the ancestor.
+        // state has already been rebuilt to the ancestor.
         if let Err(e) = validate_block_structural(chain, &parent, &block) {
             return Ok(BlockOutcome::Invalid {
                 code: e.code,
@@ -620,12 +619,14 @@ impl SyncState {
     ///
     /// The function walks from the heaviest side branch tip back to the
     /// common ancestor with the active chain, validates every block on
-    /// the new branch, then applies the new branch on top of the
-    /// ancestor state and demotes the old active blocks to `ValidFork`.
+    /// the new branch, then rebuilds the state from the block history up
+    /// to the ancestor and applies the new branch on top of it. The old
+    /// active blocks are demoted to `ValidFork`.
     ///
-    /// The state root stored in the block header is used only to find
-    /// the rollback target for the ancestor. It is not compared against
-    /// a freshly simulated root.
+    /// Because the block header does not commit to a state root, there
+    /// is no rollback target stored in the block. The state is rebuilt
+    /// by replaying the block history from genesis up to the ancestor,
+    /// which is deterministic and does not depend on any stored root.
     pub fn handle_reorg(chain: &mut Blockchain, new_block: Block) -> Result<(), String> {
         let new_chain_work = new_block.chainwork;
         let our_chain_work = chain.total_chainwork();
@@ -648,34 +649,6 @@ impl SyncState {
             }
         }
 
-        let ancestor_block = &chain.chain[ancestor_index as usize];
-
-        if ancestor_block.state_root.is_empty() {
-            return Err("ancestor block has no state root".into());
-        }
-
-        let root_bytes = hex::decode(&ancestor_block.state_root)
-            .map_err(|e| format!("invalid state root hex: {}", e))?;
-
-        if root_bytes.len() != 32 {
-            return Err("state root must be 32 bytes".into());
-        }
-
-        let mut ancestor_root = [0u8; 32];
-        ancestor_root.copy_from_slice(&root_bytes);
-
-        let tip_root_hex = match chain.chain.last() {
-            Some(tip) => tip.state_root.clone(),
-            None => return Err("chain has no tip".into()),
-        };
-        let tip_root_bytes = hex::decode(&tip_root_hex)
-            .map_err(|e| format!("invalid tip state root hex: {}", e))?;
-        if tip_root_bytes.len() != 32 {
-            return Err("tip state root must be 32 bytes".into());
-        }
-        let mut tip_root = [0u8; 32];
-        tip_root.copy_from_slice(&tip_root_bytes);
-
         // Validate the new block against the ancestor before touching the
         // live chain or state. The new block's previous_hash is the
         // ancestor hash, so the ancestor must be the current tip when
@@ -693,8 +666,9 @@ impl SyncState {
             Vec::new()
         };
 
-        if let Err(e) = chain.state.rollback_to(&ancestor_root) {
-            return Err(format!("state rollback failed: {}", e));
+        // Rebuild the state from the block history up to the ancestor.
+        if let Err(e) = rebuild_state_to_height(chain, ancestor_index) {
+            return Err(format!("state rebuild failed: {}", e));
         }
 
         chain.chain.truncate((ancestor_index + 1) as usize);
@@ -707,16 +681,16 @@ impl SyncState {
             // Restore the original chain and state if validation failed.
             chain.chain.truncate((ancestor_index + 1) as usize);
             chain.chain.extend(rollback_blocks.iter().cloned());
-            let _ = chain.state.rollback_to(&tip_root);
+            let _ = rebuild_state_to_height(chain, original_len as u64 - 1);
             return Err(format!("reorg block {} rejected: {}", new_block.index, e));
         }
 
         if let Err(e) = apply_block_transactions(chain, &new_block) {
             // Restore the original chain and state if applying the new
-            // block failed after the rollback.
+            // block failed after the rebuild.
             chain.chain.truncate((ancestor_index + 1) as usize);
             chain.chain.extend(rollback_blocks.iter().cloned());
-            let _ = chain.state.rollback_to(&tip_root);
+            let _ = rebuild_state_to_height(chain, original_len as u64 - 1);
             return Err(format!("failed to apply new block after reorg: {}", e));
         }
 
@@ -784,7 +758,6 @@ fn validate_block_structural(
     validation::rule_block_reward(block)?;
     validation::rule_block_coinbase_consistent(block)?;
     validation::rule_mined_for_valid(block, chain)?;
-    validation::rule_block_state_root_nonempty(block)?;
     validation::rule_block_pow(block)?;
     validation::rule_block_tx_count(block)?;
     validation::rule_block_timestamp_monotonic(parent, block)?;
@@ -824,8 +797,8 @@ fn validate_block_structural(
 ///
 /// The caller must ensure that the block has already been validated
 /// against the chain tip. This helper is used both by the regular
-/// accept path and by the reorg path after the state has been rolled
-/// back to the ancestor.
+/// accept path and by the reorg path after the state has been rebuilt
+/// to the ancestor.
 fn apply_block_transactions(chain: &mut Blockchain, block: &Block) -> Result<(), String> {
     for tx in &block.transactions {
         if let Err(e) = chain.apply_transaction(tx) {
@@ -841,6 +814,56 @@ fn apply_block_transactions(chain: &mut Blockchain, block: &Block) -> Result<(),
             "failed to credit reward for block {}: {}",
             block.index, e
         ));
+    }
+
+    Ok(())
+}
+
+/// Rebuild the live state by replaying the block history from genesis
+/// up to `target_height` (inclusive). The state database is reset first,
+/// then every transaction and every block reward is applied in order.
+///
+/// This is the mechanism that replaces the state-root-based rollback.
+/// Because the block header does not commit to a state root, there is
+/// no stored root to roll back to. Rebuilding from the block history is
+/// deterministic, does not depend on any stored root, and guarantees
+/// that the state matches the chain after the rebuild.
+fn rebuild_state_to_height(chain: &mut Blockchain, target_height: u64) -> Result<(), String> {
+    chain.state.reset()?;
+
+    let genesis = match chain.chain.first() {
+        Some(g) => g,
+        None => return Err("chain is empty".into()),
+    };
+
+    chain.state.update_account(
+        "GENESIS",
+        &crate::storage::Account {
+            nonce: 0,
+            balance: genesis.reward,
+            immature_rewards: std::collections::BTreeMap::new(),
+            code: Vec::new(),
+            storage: std::collections::BTreeMap::new(),
+        },
+    )?;
+
+    let end = (target_height as usize).min(chain.chain.len().saturating_sub(1));
+    for i in 1..=end {
+        let block = chain.chain[i].clone();
+        for tx in &block.transactions {
+            if validation::is_special_tx(tx) {
+                continue;
+            }
+            chain.state.apply_transaction(
+                &tx.from,
+                &tx.to,
+                tx.amount,
+                tx.fee,
+                tx.nonce,
+                block.index,
+            )?;
+        }
+        chain.state.credit_reward(&block.mined_for, block.reward, block.index)?;
     }
 
     Ok(())
@@ -953,14 +976,14 @@ fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) {
 /// Reorganize the active chain to the heaviest side branch known.
 ///
 /// The function walks from the current active tip back to the common
-/// ancestor with the side branch, rolls the state back to the ancestor,
-/// applies every block on the side branch in order, and demotes the old
-/// active blocks to `ValidFork`.
+/// ancestor with the side branch, rebuilds the state from the block
+/// history up to the ancestor, applies every block on the side branch
+/// in order, and demotes the old active blocks to `ValidFork`.
 ///
 /// If applying the new branch fails (for example because the side
-/// branch is not consistent with the state that would be rolled back
-/// to), the original chain and state are restored, the side chain pool
-/// is cleared so that the same reorganization is not attempted again on
+/// branch is not consistent with the state that would be rebuilt to),
+/// the original chain and state are restored, the side chain pool is
+/// cleared so that the same reorganization is not attempted again on
 /// every subsequent block, and an error is returned. The caller maps
 /// that error to a state mismatch, which does not disconnect the peer.
 fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), String> {
@@ -1008,7 +1031,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
     // new_branch is collected tip-to-ancestor; reverse for apply order.
     new_branch.reverse();
 
-    // Roll the state back to the ancestor.
+    // Rebuild the state from the block history up to the ancestor.
     let ancestor_block = chain
         .chain
         .iter()
@@ -1016,31 +1039,10 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
         .cloned()
         .ok_or_else(|| "reorganize: ancestor block not found".to_string())?;
 
-    let root_bytes = hex::decode(&ancestor_block.state_root)
-        .map_err(|e| format!("invalid ancestor state root hex: {}", e))?;
-    if root_bytes.len() != 32 {
-        return Err("reorganize: ancestor state root must be 32 bytes".into());
-    }
-    let mut ancestor_root = [0u8; 32];
-    ancestor_root.copy_from_slice(&root_bytes);
-
-    let tip_root_hex = match chain.chain.last() {
-        Some(t) => t.state_root.clone(),
-        None => return Err("reorganize: chain has no tip".into()),
-    };
-    let tip_root_bytes = hex::decode(&tip_root_hex)
-        .map_err(|e| format!("reorganize: invalid tip state root hex: {}", e))?;
-    if tip_root_bytes.len() != 32 {
-        return Err("reorganize: tip state root must be 32 bytes".into());
-    }
-    let mut tip_root = [0u8; 32];
-    tip_root.copy_from_slice(&tip_root_bytes);
-
     let original_chain = chain.chain.clone();
 
-    chain.state
-        .rollback_to(&ancestor_root)
-        .map_err(|e| format!("reorganize: state rollback failed: {}", e))?;
+    rebuild_state_to_height(chain, ancestor_block.index)
+        .map_err(|e| format!("reorganize: state rebuild failed: {}", e))?;
 
     // Demote the old active blocks above the ancestor.
     let ancestor_index = ancestor_block.index as usize;
@@ -1058,13 +1060,13 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
             validation::validate_block_transactions(chain, &block.transactions, block.index)
         {
             // The side branch is not consistent with the state that
-            // was rolled back to. Restore the original chain and state
+            // was rebuilt to. Restore the original chain and state
             // so that the node keeps operating on the active chain,
             // then drop every block of the side branch from the pool
             // so that the same reorganization is not attempted again
             // on every subsequent block.
             chain.chain = original_chain;
-            let _ = chain.state.rollback_to(&tip_root);
+            let _ = rebuild_state_to_height(chain, chain.chain.len() as u64 - 1);
             sync_state.side_chain_pool.clear();
             sync_state.side_chain_order.clear();
             return Err(format!(
@@ -1074,7 +1076,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
         }
         if let Err(e) = apply_block_transactions(chain, block) {
             chain.chain = original_chain;
-            let _ = chain.state.rollback_to(&tip_root);
+            let _ = rebuild_state_to_height(chain, chain.chain.len() as u64 - 1);
             sync_state.side_chain_pool.clear();
             sync_state.side_chain_order.clear();
             return Err(format!(

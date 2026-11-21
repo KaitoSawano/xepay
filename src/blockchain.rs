@@ -516,7 +516,7 @@ impl Blockchain {
 
         let size = self.mempool_size_bytes();
         let max = MAX_MEMPOOL_SIZE_BYTES;
-        
+
         if size < max / 2 {
             MIN_RELAY_FEE_PER_BYTE
         } else if size < (max * 3) / 4 {
@@ -637,11 +637,11 @@ impl Blockchain {
 
         let tx_size = Self::tx_size_bytes(&tx);
         let fee_rate = Self::fee_rate(&tx);
-        
+
         let current_min_fee = self.current_min_fee_per_byte();
         if fee_rate < current_min_fee {
             println!(
-                "[mempool] Rejected tx {}: fee rate {} < dynamic minRelayTxFee {} (mempool size: {} bytes)", 
+                "[mempool] Rejected tx {}: fee rate {} < dynamic minRelayTxFee {} (mempool size: {} bytes)",
                 tx.txid, fee_rate, current_min_fee, self.mempool_size_bytes()
             );
             return false;
@@ -729,8 +729,6 @@ impl Blockchain {
 
         self.credit_reward(&prev.mined_for, reward, next_index)?;
 
-        let state_root = hex::encode(self.state.root_hash().map_err(|e| e.to_string())?);
-
         let mut new_block = Block::new_for(
             next_index,
             prev.hash.clone(),
@@ -739,7 +737,6 @@ impl Blockchain {
             self.nbits,
             valid_txs.clone(),
             String::new(),
-            state_root,
             prev.chainwork,
         )?;
 
