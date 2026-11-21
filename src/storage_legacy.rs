@@ -260,7 +260,7 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
         }
 
         eprintln!("[node] Reindex successful! State fully rebuilt from blocks.");
-    } else if chain.chain.len() > 1 && is_state_empty(&chain) {
+    } else if chain.chain.len() > 1 && state_is_empty(&chain) {
         // The state database is empty even though the chain has more
         // than just the genesis block. This happens when the datadir was
         // created before the flat key-value state store was introduced,
@@ -277,23 +277,61 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
             std::process::exit(1);
         }
         eprintln!("[node] State rebuild successful.");
+    } else if chain.chain.len() > 1 && !state_matches_chain_tip(&chain) {
+        // The state database contains accounts, but the nonce and
+        // balance of the tip block's miner do not match the state. This
+        // happens when the state was written by a build that did not
+        // flush every update, or when the process was killed before the
+        // flush completed. Rebuild the state from the block history so
+        // that the node does not accept a block whose nonce check
+        // disagrees with the stored state.
+        eprintln!("[node] State database does not match the chain tip. Rebuilding state from block history...");
+        if let Err(e) = rebuild_state_from_blocks(&mut chain) {
+            eprintln!("[node] FATAL: State rebuild failed: {}", e);
+            std::process::exit(1);
+        }
+        if let Err(e) = chain.state.flush() {
+            eprintln!("[node] FATAL: Failed to flush state after rebuild: {}", e);
+            std::process::exit(1);
+        }
+        eprintln!("[node] State rebuild successful.");
     }
 
     Ok(chain)
 }
 
-/// Return true when the state database contains only the genesis account
-/// and nothing else. This is used to detect a state database that was
-/// deleted or never created while the block store still holds the full
-/// chain.
-fn is_state_empty(chain: &Blockchain) -> bool {
-    match chain.state.get_account("GENESIS") {
+/// Return true when the state database contains no accounts at all.
+/// This is used to detect a state database that was deleted or never
+/// created while the block store still holds the full chain.
+fn state_is_empty(chain: &Blockchain) -> bool {
+    chain.state.account_count() == 0
+}
+
+/// Return true when the state database matches the chain tip.
+///
+/// The check compares the nonce and the immature reward of the miner
+/// of the tip block against the live state. If the state was written by
+/// a build that did not flush every update, or if the process was
+/// killed before the flush completed, the two values disagree and the
+/// state must be rebuilt from the block history.
+fn state_matches_chain_tip(chain: &Blockchain) -> bool {
+    let tip = match chain.chain.last() {
+        Some(t) => t,
+        None => return true,
+    };
+
+    if tip.index == 0 {
+        return true;
+    }
+
+    match chain.state.get_account(&tip.mined_for) {
         Ok(Some(acc)) => {
-            acc.nonce == 0
-                && acc.balance == chain.chain[0].reward
-                && acc.immature_rewards.is_empty()
+            // The tip block credits its reward to the miner as an
+            // immature reward keyed by the block height. If the state
+            // was flushed correctly, that entry must be present.
+            acc.immature_rewards.contains_key(&tip.index)
         }
-        _ => true,
+        _ => false,
     }
 }
 
@@ -356,6 +394,10 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
         }
         let _ = crate::storage::undo::save(&undo);
     }
+
+    // Flush the rebuilt state so that the next start reads the accounts
+    // from disk instead of rebuilding them again.
+    chain.state.flush().map_err(Error::other)?;
 
     println!(
         "[node] reindex populated {} addresses",
