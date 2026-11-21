@@ -17,15 +17,16 @@
 //!   the live state until its branch has more total chainwork than the
 //!   active chain.
 //! - When a side branch gains more chainwork than the active chain, a
-//!   reorganization is performed: the state is rebuilt from the block
-//!   history up to the fork point, the old active blocks are demoted to
-//!   `ValidFork`, the new active blocks are promoted to `Active`, and
-//!   transactions from the abandoned branch are returned to the mempool
-//!   when still valid.
-//! - The block header does not commit to a state root. The security of
-//!   the chain comes from the strict per-transaction validation, the
-//!   exact reward check, the merkle root, the proof of work, and the
-//!   chainwork.
+//!   reorganization is performed: the blocks on the old branch are
+//!   disconnected by applying their undo data in reverse order, the old
+//!   active blocks are demoted to `ValidFork`, the new active blocks are
+//!   promoted to `Active`, and transactions from the abandoned branch
+//!   are returned to the mempool when still valid.
+//! - The block header does not commit to a state root. The undo data
+//!   stored on disk is what makes a fast rollback possible without
+//!   replaying the whole chain from genesis. The security of the chain
+//!   comes from the strict per-transaction validation, the exact reward
+//!   check, the merkle root, the proof of work, and the chainwork.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -535,7 +536,7 @@ impl SyncState {
                     message: e.message,
                 });
             }
-            apply_block_transactions(chain, &block)?;
+            apply_block_with_undo(chain, &block)?;
             chain.chain.push(block.clone());
             chain.adjust_difficulty();
 
@@ -573,7 +574,7 @@ impl SyncState {
         // run here, because the live state reflects the active tip and
         // not the side branch. They are re-run in `reorganize` and in
         // `drain_orphans` right before the block is applied, when the
-        // state has already been rebuilt to the ancestor.
+        // state has already been rolled back to the ancestor.
         if let Err(e) = validate_block_structural(chain, &parent, &block) {
             return Ok(BlockOutcome::Invalid {
                 code: e.code,
@@ -619,14 +620,15 @@ impl SyncState {
     ///
     /// The function walks from the heaviest side branch tip back to the
     /// common ancestor with the active chain, validates every block on
-    /// the new branch, then rebuilds the state from the block history up
-    /// to the ancestor and applies the new branch on top of it. The old
-    /// active blocks are demoted to `ValidFork`.
+    /// the new branch, then disconnects the old active blocks by
+    /// applying their undo data in reverse order and applies the new
+    /// branch on top of the ancestor. The old active blocks are demoted
+    /// to `ValidFork`.
     ///
     /// Because the block header does not commit to a state root, there
-    /// is no rollback target stored in the block. The state is rebuilt
-    /// by replaying the block history from genesis up to the ancestor,
-    /// which is deterministic and does not depend on any stored root.
+    /// is no rollback target stored in the block. The undo data stored
+    /// on disk is what makes the rollback possible without replaying
+    /// the whole chain from genesis.
     pub fn handle_reorg(chain: &mut Blockchain, new_block: Block) -> Result<(), String> {
         let new_chain_work = new_block.chainwork;
         let our_chain_work = chain.total_chainwork();
@@ -666,12 +668,12 @@ impl SyncState {
             Vec::new()
         };
 
-        // Rebuild the state from the block history up to the ancestor.
-        if let Err(e) = rebuild_state_to_height(chain, ancestor_index) {
-            return Err(format!("state rebuild failed: {}", e));
+        // Disconnect the old active blocks by applying their undo data
+        // in reverse order. The state is restored to the exact value it
+        // had after the ancestor block was applied.
+        if let Err(e) = rollback_to_height(chain, ancestor_index) {
+            return Err(format!("state rollback failed: {}", e));
         }
-
-        chain.chain.truncate((ancestor_index + 1) as usize);
 
         // The state now reflects the ancestor. Run the per-transaction
         // state checks against this state before applying the new block.
@@ -685,9 +687,9 @@ impl SyncState {
             return Err(format!("reorg block {} rejected: {}", new_block.index, e));
         }
 
-        if let Err(e) = apply_block_transactions(chain, &new_block) {
+        if let Err(e) = apply_block_with_undo(chain, &new_block) {
             // Restore the original chain and state if applying the new
-            // block failed after the rebuild.
+            // block failed after the rollback.
             chain.chain.truncate((ancestor_index + 1) as usize);
             chain.chain.extend(rollback_blocks.iter().cloned());
             let _ = rebuild_state_to_height(chain, original_len as u64 - 1);
@@ -793,12 +795,12 @@ fn validate_block_structural(
     Ok(())
 }
 
-/// Apply a block's transactions and reward to the live chain state.
+/// Apply a block's transactions and reward to the live chain state
+/// without recording undo data.
 ///
-/// The caller must ensure that the block has already been validated
-/// against the chain tip. This helper is used both by the regular
-/// accept path and by the reorg path after the state has been rebuilt
-/// to the ancestor.
+/// This helper is kept for callers that only need the state transition
+/// and do not need to be able to disconnect the block later. The normal
+/// accept path uses `apply_block_with_undo` instead.
 fn apply_block_transactions(chain: &mut Blockchain, block: &Block) -> Result<(), String> {
     for tx in &block.transactions {
         if let Err(e) = chain.apply_transaction(tx) {
@@ -819,15 +821,104 @@ fn apply_block_transactions(chain: &mut Blockchain, block: &Block) -> Result<(),
     Ok(())
 }
 
+/// Apply a block to the live state and record the undo data that is
+/// needed to disconnect it later.
+///
+/// The undo data records the pre-block value of every account that the
+/// block modifies: the sender and recipient of every transaction, and
+/// the miner that receives the reward. When the block is later
+/// disconnected, the undo data restores those accounts to their
+/// pre-block value, which undoes the block without replaying the chain.
+fn apply_block_with_undo(chain: &mut Blockchain, block: &Block) -> Result<(), String> {
+    let mut undo = crate::storage::undo::UndoData::new(block.index);
+
+    // Record the pre-block value of every account the block touches.
+    for tx in &block.transactions {
+        if validation::is_special_tx(tx) {
+            continue;
+        }
+        if let Ok(Some(acc)) = chain.state.get_account(&tx.from) {
+            undo.record(&tx.from, acc);
+        }
+        if tx.from != tx.to {
+            if let Ok(Some(acc)) = chain.state.get_account(&tx.to) {
+                undo.record(&tx.to, acc);
+            }
+        }
+    }
+    if let Ok(Some(acc)) = chain.state.get_account(&block.mined_for) {
+        undo.record(&block.mined_for, acc);
+    }
+
+    // Apply the transactions and the reward.
+    apply_block_transactions(chain, block)?;
+
+    // Persist the undo data. This happens after the state transition so
+    // that a crash between the state write and the undo write is not
+    // possible: the undo file is written only for blocks whose state
+    // transition has already been committed to the state database.
+    crate::storage::undo::save(&undo)?;
+
+    Ok(())
+}
+
+/// Disconnect blocks from the active tip down to (but not including)
+/// `target_height`, applying the undo data of each block in reverse
+/// order. The state is restored to the exact value it had after the
+/// block at `target_height` was applied.
+///
+/// This is the account-based equivalent of the UTXO undo data used by
+/// the reference node. It is O(number of disconnected blocks), not
+/// O(chain length), so a reorganization only touches the blocks that
+/// are actually being replaced.
+fn rollback_to_height(chain: &mut Blockchain, target_height: u64) -> Result<(), String> {
+    while chain.height() > target_height {
+        let tip = match chain.chain.last() {
+            Some(b) => b.clone(),
+            None => return Err("chain is empty".into()),
+        };
+
+        let undo = match crate::storage::undo::load(tip.index)? {
+            Some(u) => u,
+            None => {
+                // Undo data is missing. This happens for blocks that
+                // were applied before the undo data was introduced.
+                // Fall back to rebuilding the state from the block
+                // history so that the node keeps operating.
+                eprintln!(
+                    "[reorg] undo data missing for block {}; falling back to state rebuild",
+                    tip.index
+                );
+                rebuild_state_to_height(chain, target_height)?;
+                return Ok(());
+            }
+        };
+
+        // Apply the reverse patch: restore every account that the
+        // block modified to its pre-block value.
+        for entry in &undo.entries {
+            chain
+                .state
+                .update_account(&entry.address, &entry.account)
+                .map_err(|e| format!("failed to restore account {}: {}", entry.address, e))?;
+        }
+
+        chain.chain.pop();
+        let _ = crate::storage::undo::delete(tip.index);
+        let _ = storage::set_block_status(&tip.hash, BlockStatus::ValidFork);
+    }
+
+    chain.adjust_difficulty();
+    Ok(())
+}
+
 /// Rebuild the live state by replaying the block history from genesis
 /// up to `target_height` (inclusive). The state database is reset first,
 /// then every transaction and every block reward is applied in order.
 ///
-/// This is the mechanism that replaces the state-root-based rollback.
-/// Because the block header does not commit to a state root, there is
-/// no stored root to roll back to. Rebuilding from the block history is
-/// deterministic, does not depend on any stored root, and guarantees
-/// that the state matches the chain after the rebuild.
+/// This is the fallback mechanism that is used when the undo data for a
+/// block is missing, and by the manual reindex path. The normal reorg
+/// path uses `rollback_to_height`, which is much faster.
 fn rebuild_state_to_height(chain: &mut Blockchain, target_height: u64) -> Result<(), String> {
     chain.state.reset()?;
 
@@ -946,7 +1037,7 @@ fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) {
                     }
                     continue;
                 }
-                if let Err(e) = apply_block_transactions(chain, &orphan.block) {
+                if let Err(e) = apply_block_with_undo(chain, &orphan.block) {
                     // Applying the orphan failed. The state may have
                     // been partially mutated, so the orphan is dropped
                     // and the loop continues. The peer is not punished
@@ -976,14 +1067,15 @@ fn drain_orphans(chain: &mut Blockchain, sync_state: &mut SyncState) {
 /// Reorganize the active chain to the heaviest side branch known.
 ///
 /// The function walks from the current active tip back to the common
-/// ancestor with the side branch, rebuilds the state from the block
-/// history up to the ancestor, applies every block on the side branch
-/// in order, and demotes the old active blocks to `ValidFork`.
+/// ancestor with the side branch, disconnects the old active blocks by
+/// applying their undo data in reverse order, applies every block on
+/// the side branch in order, and demotes the old active blocks to
+/// `ValidFork`.
 ///
 /// If applying the new branch fails (for example because the side
-/// branch is not consistent with the state that would be rebuilt to),
-/// the original chain and state are restored, the side chain pool is
-/// cleared so that the same reorganization is not attempted again on
+/// branch is not consistent with the state that would be rolled back
+/// to), the original chain and state are restored, the side chain pool
+/// is cleared so that the same reorganization is not attempted again on
 /// every subsequent block, and an error is returned. The caller maps
 /// that error to a state mismatch, which does not disconnect the peer.
 fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), String> {
@@ -1031,7 +1123,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
     // new_branch is collected tip-to-ancestor; reverse for apply order.
     new_branch.reverse();
 
-    // Rebuild the state from the block history up to the ancestor.
+    // Find the ancestor block on the active chain.
     let ancestor_block = chain
         .chain
         .iter()
@@ -1041,15 +1133,17 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
 
     let original_chain = chain.chain.clone();
 
-    rebuild_state_to_height(chain, ancestor_block.index)
-        .map_err(|e| format!("reorganize: state rebuild failed: {}", e))?;
+    // Disconnect the old active blocks by applying their undo data in
+    // reverse order. The state is restored to the exact value it had
+    // after the ancestor block was applied.
+    rollback_to_height(chain, ancestor_block.index)
+        .map_err(|e| format!("reorganize: state rollback failed: {}", e))?;
 
     // Demote the old active blocks above the ancestor.
     let ancestor_index = ancestor_block.index as usize;
-    for old_block in chain.chain[(ancestor_index + 1)..].iter() {
+    for old_block in original_chain[(ancestor_index + 1)..].iter() {
         let _ = storage::set_block_status(&old_block.hash, BlockStatus::ValidFork);
     }
-    chain.chain.truncate(ancestor_index + 1);
 
     // Apply the new branch.
     for block in &new_branch {
@@ -1060,7 +1154,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
             validation::validate_block_transactions(chain, &block.transactions, block.index)
         {
             // The side branch is not consistent with the state that
-            // was rebuilt to. Restore the original chain and state
+            // was rolled back to. Restore the original chain and state
             // so that the node keeps operating on the active chain,
             // then drop every block of the side branch from the pool
             // so that the same reorganization is not attempted again
@@ -1074,7 +1168,7 @@ fn reorganize(chain: &mut Blockchain, sync_state: &mut SyncState) -> Result<(), 
                 block.index, e.code, e.message
             ));
         }
-        if let Err(e) = apply_block_transactions(chain, block) {
+        if let Err(e) = apply_block_with_undo(chain, block) {
             chain.chain = original_chain;
             let _ = rebuild_state_to_height(chain, chain.chain.len() as u64 - 1);
             sync_state.side_chain_pool.clear();
@@ -1166,7 +1260,7 @@ pub fn accept_block(chain: &mut Blockchain, block: Block) -> Result<(), String> 
         return Err(format!("block {} rejected: {}", block.index, e));
     }
 
-    apply_block_transactions(chain, &block)?;
+    apply_block_with_undo(chain, &block)?;
 
     chain.chain.push(block);
     chain.adjust_difficulty();
