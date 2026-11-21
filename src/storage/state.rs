@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusty_leveldb::{Options, DB as LevelDB};
+use rusty_leveldb::{LdbIterator, Options, DB as LevelDB};
 
 use super::account::Account;
 use crate::consensus::rules;
@@ -160,6 +160,17 @@ impl StateDB {
         }
         db.flush().map_err(|e| format!("{:?}", e))?;
         Ok(())
+    }
+
+    /// Return the number of accounts currently stored in the database.
+    /// This is used by the node to decide whether the state database is
+    /// empty and needs to be rebuilt from the block history.
+    pub fn account_count(&self) -> usize {
+        let mut db = self.db.lock().unwrap();
+        match collect_keys(&mut db) {
+            Ok(keys) => keys.len(),
+            Err(_) => 0,
+        }
     }
 
     /// Return the total balance of an address.
@@ -349,10 +360,16 @@ fn empty_account() -> Account {
     }
 }
 
+/// Collect every key currently stored in the database.
+///
+/// The iterator returned by `rusty-leveldb` does not seek to the first
+/// entry automatically. Without an explicit `seek_to_first`, the loop
+/// below would either return nothing or start from an arbitrary point,
+/// which is why the previous version of `reset` left stale accounts in
+/// the database. The explicit seek fixes that.
 fn collect_keys(db: &mut LevelDB) -> Result<Vec<Vec<u8>>, String> {
-    use rusty_leveldb::LdbIterator;
-
     let mut iter = db.new_iter().map_err(|e| format!("{:?}", e))?;
+    iter.seek_to_first();
     let mut keys = Vec::new();
     while let Some((key, _)) = iter.next() {
         keys.push(key);
