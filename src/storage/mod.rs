@@ -8,11 +8,13 @@ pub mod account;
 pub mod state;
 pub mod block_store;
 pub mod block_index;
+pub mod undo;
 
 pub use account::Account;
 pub use state::StateDB;
 pub use block_store::BlockStore;
 pub use block_index::{BlockIndex, BlockIndexEntry, BlockStatus};
+pub use undo::{UndoData, UndoEntry};
 
 // P2P-only helper: write the block to disk without touching the state.
 // This keeps P2P from interfering with the mining process.
