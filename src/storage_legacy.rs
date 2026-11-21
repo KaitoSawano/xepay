@@ -184,6 +184,7 @@ pub fn load_chain() -> std::io::Result<Blockchain> {
     if reindex_requested {
         eprintln!("[node] Manual reindex requested. Deleting state database...");
         let _ = std::fs::remove_dir_all(&db_path);
+        let _ = crate::storage::undo::delete_all();
     }
 
     let state = crate::storage::StateDB::open(&db_path)
@@ -318,8 +319,17 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
     }
 
     for block in blocks.iter().skip(1) {
+        let mut undo = crate::storage::undo::UndoData::new(block.index);
         for tx in &block.transactions {
             if !validation::is_special_tx(tx) {
+                if let Ok(Some(acc)) = chain.state.get_account(&tx.from) {
+                    undo.record(&tx.from, acc);
+                }
+                if tx.from != tx.to {
+                    if let Ok(Some(acc)) = chain.state.get_account(&tx.to) {
+                        undo.record(&tx.to, acc);
+                    }
+                }
                 chain.state.apply_transaction(
                     &tx.from,
                     &tx.to,
@@ -336,11 +346,15 @@ fn rebuild_state_from_blocks(chain: &mut Blockchain) -> std::io::Result<()> {
                 }
             }
         }
+        if let Ok(Some(acc)) = chain.state.get_account(&block.mined_for) {
+            undo.record(&block.mined_for, acc);
+        }
         chain.state.credit_reward(&block.mined_for, block.reward, block.index)
             .map_err(|e| Error::other(format!("Failed to credit reward block {}: {}", block.index, e)))?;
         if !block.mined_for.is_empty() && !chain.addresses.contains(&block.mined_for) {
             chain.addresses.push(block.mined_for.clone());
         }
+        let _ = crate::storage::undo::save(&undo);
     }
 
     println!(
